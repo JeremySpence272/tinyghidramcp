@@ -1,0 +1,269 @@
+"""Hand-written long-form docs for every tool, returned by ``meta.help``.
+
+Each entry has:
+- ``description``: full prose (longer than the one-line tools/list version)
+- ``parameters``: list of ``{name, type, description, required}``
+- ``examples``: list of ``{args, result_summary}``
+- ``pyghidra_alternative``: a one-line copy-pasteable pyghidra.exec snippet
+  that does the same thing (or close enough to teach the agent the API)
+
+Don't auto-generate from docstrings -- the value is in writing these as if
+talking to an agent that's about to use the tool right now.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+DOCS: dict[str, dict[str, Any]] = {
+    "binary.summary": {
+        "description": (
+            "Recon-in-one-call. Returns the open program's language id, executable "
+            "format, image base, entry point, sections (with R/W/X flags), dynamic "
+            "dependencies, security flags (NX / PIE / RELRO / canary / stripped), "
+            "language/runtime hint (c / c++ / go / rust), and the top-200 symbols "
+            "filtered by `exported OR (named AND not-synthetic AND xrefs > 1)`, "
+            "sorted by xref count descending. Cached for the session; subsequent "
+            "calls return `cached: true` without re-running. Call this once at the "
+            "start of every session before anything else."
+        ),
+        "parameters": [],
+        "examples": [
+            {
+                "args": {},
+                "result_summary": (
+                    "{language_id: 'x86:LE:64:default', entry_point: '0x401050', "
+                    "language_hint: 'c', security: {nx: true, pie: true, "
+                    "relro: 'full', canary: true, stripped: false}, "
+                    "top_symbols: [{name: 'main', address: '0x401234', xrefs: 12}, ...], "
+                    "cached: false}"
+                ),
+            }
+        ],
+        "pyghidra_alternative": (
+            "currentProgram.getLanguageID(), currentProgram.getImageBase(), "
+            "[(s.getName(), '0x%x' % s.getAddress().getOffset()) for s in sm.getDefinedSymbols()][:200]"
+        ),
+    },
+    "search.functions": {
+        "description": (
+            "Search functions by name. Default is regex; set exact=true for literal "
+            "string match. Returns name, entry address, and signature for each hit."
+        ),
+        "parameters": [
+            {"name": "name", "type": "string", "description": "Regex pattern (or literal if exact=true)", "required": True},
+            {"name": "limit", "type": "integer", "description": "Max results (default 50)", "required": False},
+            {"name": "exact", "type": "boolean", "description": "Disable regex; literal match", "required": False},
+        ],
+        "examples": [
+            {"args": {"name": "^parse_"}, "result_summary": "matches parse_args, parse_input, parse_config"},
+            {"args": {"name": "main", "exact": True}, "result_summary": "exact: one hit for 'main' at 0x401234"},
+        ],
+        "pyghidra_alternative": (
+            "[(f.getName(), '0x%x' % f.getEntryPoint().getOffset()) for f in fm.getFunctions(True) if 'parse_' in f.getName()]"
+        ),
+    },
+    "search.strings": {
+        "description": (
+            "Search defined strings in the program. Returns address, length, and content "
+            "for each hit. Strings shorter than min_length are skipped (typical default 4)."
+        ),
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Substring or regex to match", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max results (default 50)", "required": False},
+            {"name": "offset", "type": "integer", "description": "Skip this many before returning results", "required": False},
+        ],
+        "examples": [
+            {"args": {"query": "flag"}, "result_summary": "[{address: '0x403100', value: 'flag{...}'}, ...]"},
+            {"args": {"query": "%s"}, "result_summary": "format-string strings used in printf-family calls"},
+        ],
+        "pyghidra_alternative": (
+            "[(d.getAddress(), str(d.getValue())) for d in listing.getDefinedData(True) "
+            "if d.hasStringValue() and 'flag' in str(d.getValue())]"
+        ),
+    },
+    "decompile": {
+        "description": (
+            "Decompile one function. `function_start` accepts a hex address "
+            "(`0x401234` or `401234`) or a symbol name (`main`, `main.main`, `_Znwm`). "
+            "The server auto-resolves: if you pass an address inside a function, it "
+            "decompiles the containing function and tells you via `address_adjusted`. "
+            "PLT thunks are resolved to their target. Unanalysed code / data / "
+            "out-of-image misses return a structured error with `next_action` and a "
+            "`pyghidra_hint` for the agent's next move."
+        ),
+        "parameters": [
+            {"name": "function_start", "type": "string", "description": "Hex address or symbol name", "required": True},
+            {"name": "timeout_secs", "type": "integer", "description": "Decompiler timeout (default 30)", "required": False},
+            {"name": "max_lines", "type": "integer", "description": "Truncate to this many lines (default 800; hard ceiling 4000)", "required": False},
+        ],
+        "examples": [
+            {"args": {"function_start": "main"}, "result_summary": "decompiles `main`; address_adjusted shows symbol_lookup"},
+            {"args": {"function_start": "0x40123a"}, "result_summary": "mid-function offset; adjusts to containing function entry"},
+        ],
+        "pyghidra_alternative": (
+            "decompAPI.decompileFunction(fm.getFunctionAt(toAddr(0x401234)), 30, monitor).getDecompiledFunction().getC()"
+        ),
+    },
+    "decompile.batch": {
+        "description": (
+            "Decompile many functions in one call. Returns a dict keyed by the input "
+            "target string (exactly what you passed). Per-target failures are recorded "
+            "as error entries; the whole call still succeeds. Use this when you've "
+            "identified N candidate functions from `search.functions` or `xrefs.to` "
+            "and want them all without N round-trips."
+        ),
+        "parameters": [
+            {"name": "targets", "type": "array", "description": "List of addresses or names", "required": True},
+            {"name": "max_lines_each", "type": "integer", "description": "Per-function line cap (default 200)", "required": False},
+        ],
+        "examples": [
+            {
+                "args": {"targets": ["main", "parse_args", "0x405000"]},
+                "result_summary": "{'main': {...}, 'parse_args': {...}, '0x405000': {...}}",
+            }
+        ],
+        "pyghidra_alternative": (
+            "{name: decompAPI.decompileFunction(fm.getFunctionAt(toAddr(addr)), 30, monitor).getDecompiledFunction().getC() "
+            "for name, addr in [('main', 0x401234), ('parse_args', 0x405000)]}"
+        ),
+    },
+    "disassemble": {
+        "description": (
+            "Disassemble a function (when `address` resolves to a function) or a byte "
+            "range (otherwise). Every line carries the absolute address and the "
+            "demangled symbol. Same address-tolerance as `decompile`."
+        ),
+        "parameters": [
+            {"name": "address", "type": "string", "description": "Hex address or symbol name", "required": True},
+            {"name": "limit", "type": "integer", "description": "Max instructions (default 100)", "required": False},
+        ],
+        "examples": [
+            {"args": {"address": "main"}, "result_summary": "function-scope disassembly of main"},
+            {"args": {"address": "0x401000", "limit": 20}, "result_summary": "20 instructions starting at 0x401000"},
+        ],
+        "pyghidra_alternative": (
+            "[str(listing.getInstructionAt(toAddr(addr))) for addr in range(0x401000, 0x401100, 4)]"
+        ),
+    },
+    "xrefs.to": {
+        "description": (
+            "Find references TO an address. Code-only by default; set `include_data=true` "
+            "to include data references. The address can be a function entry, an "
+            "instruction offset, or a data label. Returns from-address, type "
+            "(call / jump / read / write), and the containing function name when applicable."
+        ),
+        "parameters": [
+            {"name": "address", "type": "string", "description": "Target address or symbol", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max results (default 100)", "required": False},
+        ],
+        "examples": [
+            {"args": {"address": "0x401234"}, "result_summary": "callers of 0x401234"},
+        ],
+        "pyghidra_alternative": (
+            "[(r.getFromAddress(), str(r.getReferenceType())) for r in "
+            "currentProgram.getReferenceManager().getReferencesTo(toAddr(0x401234))]"
+        ),
+    },
+    "xrefs.from": {
+        "description": (
+            "Find references FROM an address: where does this instruction or data label "
+            "send control or data? Mirror of `xrefs.to`."
+        ),
+        "parameters": [
+            {"name": "address", "type": "string", "description": "Source address or symbol", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max results (default 100)", "required": False},
+        ],
+        "examples": [
+            {"args": {"address": "main"}, "result_summary": "every call/jump/data-ref out of main"},
+        ],
+        "pyghidra_alternative": (
+            "[(r.getToAddress(), str(r.getReferenceType())) for r in "
+            "currentProgram.getReferenceManager().getReferencesFrom(toAddr(0x401234))]"
+        ),
+    },
+    "callgraph": {
+        "description": (
+            "Bounded call-graph traversal between two functions. Returns a flat list of "
+            "`(caller_addr, callee_addr, callsite_addr, callee_name)` edges. Use when "
+            "you need to understand how control flows from one function to another "
+            "without N round-trips through `xrefs.from`."
+        ),
+        "parameters": [
+            {"name": "source_function", "type": "string", "description": "Hex address or name of starting function", "required": True},
+            {"name": "target_function", "type": "string", "description": "Hex address or name of ending function", "required": True},
+            {"name": "max_depth", "type": "integer", "description": "Max edges to traverse (default 4)", "required": False},
+            {"name": "limit", "type": "integer", "description": "Max paths returned", "required": False},
+        ],
+        "examples": [
+            {
+                "args": {"source_function": "main", "target_function": "system"},
+                "result_summary": "paths from main to system, including intermediate calls",
+            }
+        ],
+        "pyghidra_alternative": "(traverse fm.getReferenceManager() manually; non-trivial)",
+    },
+    "resolve": {
+        "description": (
+            "Resolve a name or expression to one or more candidate addresses. Useful "
+            "when you have a symbol from `nm` or `objdump` and want to confirm Ghidra "
+            "sees it. Returns address, section, type (function / data / import / "
+            "export), and a confidence score per candidate."
+        ),
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Symbol name or expression", "required": True},
+        ],
+        "examples": [
+            {"args": {"query": "main"}, "result_summary": "[{address: '0x401234', type: 'function', confidence: 1.0}]"},
+        ],
+        "pyghidra_alternative": (
+            "[('0x%x' % s.getAddress().getOffset(), str(s.getSymbolType())) for s in sm.getSymbols('main')]"
+        ),
+    },
+    "pyghidra.exec": {
+        "description": (
+            "Run arbitrary Python with the open program bound. No sandbox; runs as "
+            "root in the agent's container with full Ghidra-API and filesystem "
+            "access. Globals persist across calls in the same session, so you can "
+            "build up state. Bound names: `currentProgram`, `currentAddress` "
+            "(sticky), `monitor`, `flatAPI`, `decompAPI`, `listing`, `fm`, `sm`, "
+            "`mem`, `cache` (with `cache.invalidate()` to flush decompile cache). "
+            "Auto-detects single-line expression vs multi-line script: an expression "
+            "returns its value as `result`; a script can set `result` explicitly."
+        ),
+        "parameters": [
+            {"name": "code", "type": "string", "description": "Python source code", "required": True},
+            {"name": "timeout_sec", "type": "integer", "description": "Wall-clock timeout (default 60)", "required": False},
+        ],
+        "examples": [
+            {
+                "args": {"code": "fm.getFunctionAt(toAddr(0x401234)).getName()"},
+                "result_summary": "expression returns 'main'",
+            },
+            {
+                "args": {"code": "result = [f.getName() for f in fm.getFunctions(True) if 'aes' in f.getName().lower()]"},
+                "result_summary": "script returns list of AES-related function names",
+            },
+        ],
+        "pyghidra_alternative": "(this IS the pyghidra escape hatch)",
+    },
+    "meta.help": {
+        "description": (
+            "Return long-form documentation for any named tool. Use this when "
+            "`tools/list` description is too terse, or when you want a concrete "
+            "example invocation, or when you want the `pyghidra.exec` equivalent."
+        ),
+        "parameters": [
+            {"name": "tool", "type": "string", "description": "Name of the tool to look up", "required": True},
+        ],
+        "examples": [
+            {"args": {"tool": "decompile"}, "result_summary": "full docs + examples for `decompile`"},
+        ],
+        "pyghidra_alternative": "(meta tool; no pyghidra equivalent)",
+    },
+}
+
+
+def get(tool: str) -> dict[str, Any] | None:
+    """Look up the hand-written entry for one tool. Returns None if unknown."""
+    return DOCS.get(tool)

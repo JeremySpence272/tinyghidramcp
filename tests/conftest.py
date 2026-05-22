@@ -1,70 +1,76 @@
+"""Shared test fixtures."""
+
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-from pathlib import Path
 
 import pytest
-from ghidra_headless_mcp.backend import GhidraBackend
-from ghidra_headless_mcp.fake_ghidra import FakeGhidraBackend
-from ghidra_headless_mcp.server import SimpleMcpServer
+
+
+@pytest.fixture(autouse=True)
+def _disable_telemetry(monkeypatch):
+    """Disable telemetry by default for unit tests; override per-test as needed."""
+    monkeypatch.setenv("TINYGHIDRAMCP_TELEMETRY_DIR", "")
+    yield
 
 
 @pytest.fixture
-def sample_binary_path() -> str:
-    fixtures = Path(__file__).resolve().parent / "fixtures"
-    source_path = fixtures / "hello.c"
-    binary_path = fixtures / "hello"
-
-    compiler = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-    if compiler is None:
-        pytest.skip("no C compiler found (cc/gcc/clang)")
-
-    if not binary_path.exists() or binary_path.stat().st_mtime < source_path.stat().st_mtime:
-        subprocess.run(
-            [compiler, str(source_path), "-O0", "-g", "-fno-inline", "-o", str(binary_path)],
-            check=True,
-        )
-
-    return str(binary_path)
+def telemetry_dir(tmp_path, monkeypatch):
+    """Enable telemetry into a per-test directory."""
+    d = tmp_path / "telemetry"
+    d.mkdir()
+    monkeypatch.setenv("TINYGHIDRAMCP_TELEMETRY_DIR", str(d))
+    monkeypatch.setenv("TINYGHIDRAMCP_SESSION_ID", "test-session")
+    yield d
 
 
 @pytest.fixture
-def fake_backend() -> FakeGhidraBackend:
-    return FakeGhidraBackend()
+def stub_backend():
+    """Backend stub that returns canned responses for any mapped method.
+
+    Tests set ``backend.next_eval_response`` before calling a tool that triggers
+    the address-tolerance pipeline. Each stub method records its last call in
+    ``backend.calls``.
+    """
+    from tinyghidramcp.server import _BACKEND_TOOL_NAME_MAP
+
+    class StubBackend:
+        def __init__(self):
+            self.next_eval_response = None
+            self.calls: list[tuple[str, tuple, dict]] = []
+
+        def _record(self, name, args, kwargs):
+            self.calls.append((name, args, kwargs))
+
+        def eval_code(self, code, *, session_id=None):
+            self._record("eval_code", (code,), {"session_id": session_id})
+            return {"result": self.next_eval_response}
+
+        def decomp_function(self, session_id, function_start, *, timeout_secs=30):
+            self._record("decomp_function", (session_id, function_start),
+                         {"timeout_secs": timeout_secs})
+            return {"ok": True, "decompile_of": function_start}
+
+        def disasm_function(self, session_id, address, *, limit=None):
+            self._record("disasm_function", (session_id, address), {"limit": limit})
+            return {"ok": True, "disasm_of": address}
+
+        def __getattr__(self, name):
+            if name in _BACKEND_TOOL_NAME_MAP:
+                def stub(*args, **kwargs):
+                    self._record(name, args, kwargs)
+                    return {"ok": True, "stub": name}
+                return stub
+            raise AttributeError(name)
+
+    return StubBackend()
 
 
 @pytest.fixture
-def fake_server(fake_backend: FakeGhidraBackend) -> SimpleMcpServer:
-    return SimpleMcpServer(fake_backend)
+def server(stub_backend):
+    """A SimpleMcpServer wired to the stub backend with a fake session."""
+    from tinyghidramcp.server import SimpleMcpServer
 
-
-@pytest.fixture
-def ghidra_install_dir() -> str:
-    from pathlib import Path
-
-    env_value = os.environ.get("GHIDRA_INSTALL_DIR")
-    if env_value:
-        return env_value
-
-    system_install = Path("/usr/share/ghidra")
-    if system_install.exists():
-        return str(system_install)
-
-    pytest.skip("GHIDRA_INSTALL_DIR is not set and /usr/share/ghidra is unavailable")
-
-
-@pytest.fixture
-def real_backend(ghidra_install_dir: str) -> GhidraBackend:
-    os.environ.setdefault("XDG_CONFIG_HOME", "/tmp/codex-config")
-    Path(os.environ["XDG_CONFIG_HOME"]).mkdir(parents=True, exist_ok=True)
-    pyghidra = pytest.importorskip("pyghidra")
-    backend = GhidraBackend(pyghidra, install_dir=ghidra_install_dir)
-    yield backend
-    backend.shutdown()
-
-
-@pytest.fixture
-def real_server(real_backend: GhidraBackend) -> SimpleMcpServer:
-    return SimpleMcpServer(real_backend)
+    srv = SimpleMcpServer(stub_backend)
+    srv._auto_session_id = "sess-fake"
+    return srv

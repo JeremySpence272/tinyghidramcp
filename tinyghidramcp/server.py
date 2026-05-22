@@ -10,7 +10,36 @@ from dataclasses import dataclass
 from typing import Any, BinaryIO
 
 from ._version import __version__
+from .address_tolerance import resolve as _resolve_address
 from .backend import GhidraBackend, GhidraBackendError
+from .errors import ToolError, build_error_payload
+
+# Hard ceiling on decompile output. Agents can lower via the per-call arg; this
+# is the upper bound applied even when no arg is given.
+DECOMPILE_HARD_CEILING_LINES = 4000
+DECOMPILE_DEFAULT_LINES = 800
+
+
+def _apply_max_lines(payload: dict, max_lines: int | None) -> dict:
+    """Truncate the `decompiled` / `result` text in a decompile payload.
+
+    Looks at common upstream keys (``decompiled``, ``decompile_of``, ``result``)
+    and clips to ``max_lines`` lines. ``max_lines=None`` falls back to the
+    default; the hard ceiling always applies.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    cap = max_lines or DECOMPILE_DEFAULT_LINES
+    cap = min(cap, DECOMPILE_HARD_CEILING_LINES)
+    for key in ("decompiled", "decompile", "c_code", "result"):
+        value = payload.get(key)
+        if isinstance(value, str) and "\n" in value:
+            lines = value.split("\n")
+            if len(lines) > cap:
+                payload[key] = "\n".join(lines[:cap])
+                payload["truncated_lines"] = len(lines) - cap
+                payload["max_lines_applied"] = cap
+    return payload
 
 _ADDRESS_SCHEMA: dict[str, Any] = {
     "oneOf": [{"type": "integer"}, {"type": "string"}],
@@ -188,6 +217,10 @@ def _backend_tool_spec(backend_method: str) -> dict[str, Any]:
     for name, param in signature.parameters.items():
         if name == "self":
             continue
+        # session_id is injected by the server (one program per session); never
+        # surfaced on the agent's tool input schema.
+        if name == "session_id":
+            continue
         properties[name] = _tool_property_schema(name, param)
         if param.default is inspect._empty:
             required.append(name)
@@ -226,7 +259,18 @@ def _build_backend_tool_specs() -> tuple[dict[str, Any], ...]:
     )
 
 
-BACKEND_TOOL_SPECS: tuple[dict[str, Any], ...] = _build_backend_tool_specs()
+def _augment_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Patch auto-generated specs where the custom handler accepts extra args."""
+    if spec["name"] == "decompile":
+        # Custom handler accepts max_lines on top of the upstream signature.
+        spec["properties"]["max_lines"] = {"type": "integer"}
+    return spec
+
+
+BACKEND_TOOL_SPECS: tuple[dict[str, Any], ...] = tuple(
+    _augment_spec(dict(spec, properties=dict(spec["properties"])))
+    for spec in _build_backend_tool_specs()
+)
 
 ALL_TOOL_SPECS: tuple[dict[str, Any], ...] = _SERVER_TOOL_SPECS + BACKEND_TOOL_SPECS
 
@@ -247,16 +291,89 @@ class JsonRpcError(Exception):
 
 
 class SimpleMcpServer:
-    """Simple MCP-compatible server exposing Ghidra tools."""
+    """Simple MCP-compatible server exposing Ghidra tools.
 
-    def __init__(self, backend: Any):
+    Single-program-per-session model. On bootstrap, the server opens the warmed
+    Ghidra project at WARMED_PROJECT_DIR (populated by revbench's warm-up step
+    before the server is spawned) and stashes the resulting session_id. The
+    session_id is then injected into every backend tool call; it never appears
+    in the agent's input schema.
+    """
+
+    WARMED_PROJECT_DIR = "/var/lib/tinyghidramcp/project"
+    WARMED_PROJECT_NAME = "tgm"
+    BINARY_PATH = "/workspace/challenge/binary"
+
+    def __init__(self, backend: Any, telemetry: Any = None):
+        from .decompile_cache import DecompileCache
+        from .telemetry import Telemetry, from_env
+
         self._backend = backend
+        self._auto_session_id: str | None = None
+        self._telemetry: Telemetry = telemetry if telemetry is not None else from_env()
+        self._decompile_cache = DecompileCache()
+        # Cached binary.summary response for the session; computed once on first call.
+        self._binary_summary_cache: dict[str, Any] | None = None
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "meta.help": self._tool_meta_help,
             "decompile.batch": self._tool_decompile_batch,
         }
         for spec in BACKEND_TOOL_SPECS:
-            self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
+            if spec["name"] == "pyghidra.exec":
+                # Custom wrapper: persistent globals, bound aliases, cache helper.
+                self._tool_handlers[spec["name"]] = self._tool_pyghidra_exec
+            elif spec["name"] == "decompile":
+                # Custom wrapper: address tolerance + LRU cache.
+                self._tool_handlers[spec["name"]] = self._tool_decompile
+            elif spec["name"] == "binary.summary":
+                # Custom wrapper: composes upstream + recon script into curated response.
+                self._tool_handlers[spec["name"]] = self._tool_binary_summary
+            else:
+                self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
+
+    def bootstrap_program(self) -> None:
+        """Open the warmed Ghidra project and bind it as the implicit session.
+
+        Called once at server startup by the CLI. Raises RuntimeError if the
+        warmed project is missing or doesn't contain exactly one program.
+        """
+        import os
+
+        if not os.path.isdir(self.WARMED_PROJECT_DIR):
+            raise RuntimeError(
+                f"warmed Ghidra project not found at {self.WARMED_PROJECT_DIR}. "
+                "The warm-up step (analyzeHeadless) must run before the server starts."
+            )
+        # Ensure the JVM is up so we can call Ghidra API directly.
+        self._backend._ensure_started()
+        program_name = self._discover_only_program()
+        result = self._backend.session_open_existing(
+            self.WARMED_PROJECT_DIR,
+            self.WARMED_PROJECT_NAME,
+            program_name=program_name,
+            read_only=True,
+        )
+        self._auto_session_id = result["session_id"]
+
+    def _discover_only_program(self) -> str:
+        from ghidra.base.project import GhidraProject  # type: ignore[import-not-found]
+
+        project = GhidraProject.openProject(self.WARMED_PROJECT_DIR, self.WARMED_PROJECT_NAME)
+        try:
+            files = list(project.getRootFolder().getFiles())
+            programs = [f for f in files if str(f.getContentType()) == "Program"]
+            if not programs:
+                raise RuntimeError(
+                    f"no programs found in project at {self.WARMED_PROJECT_DIR}"
+                )
+            if len(programs) > 1:
+                names = [str(f.getName()) for f in programs]
+                raise RuntimeError(
+                    f"expected exactly one program in project, found {len(programs)}: {names}"
+                )
+            return str(programs[0].getName())
+        finally:
+            project.close()
 
     def serve_stdio(
         self,
@@ -290,6 +407,11 @@ class SimpleMcpServer:
         try:
             request = json.loads(line)
         except json.JSONDecodeError as exc:
+            self._telemetry.emit_pre_dispatch_error(
+                error_code="json_parse_error",
+                raw_args_preview=line,
+                message=str(exc),
+            )
             error = JsonRpcError(code=-32700, message="Parse error", data=str(exc))
             return json.dumps(self._error_response(None, error), sort_keys=True)
 
@@ -563,12 +685,27 @@ class SimpleMcpServer:
         return response
 
     def _dispatch_tool_call(self, params: dict[str, Any]) -> dict[str, Any]:
+        import time
+
         name = params.get("name")
         arguments = params.get("arguments", {})
 
         if not isinstance(name, str):
+            self._telemetry.emit_pre_dispatch_error(
+                error_code="validation_error",
+                validation_field="name",
+                validation_expected="string",
+                message="tools/call requires 'name'",
+            )
             raise JsonRpcError(code=-32602, message="Invalid params: tools/call requires 'name'")
         if not isinstance(arguments, dict):
+            self._telemetry.emit_pre_dispatch_error(
+                error_code="validation_error",
+                tool=name,
+                validation_field="arguments",
+                validation_expected="object",
+                message="tools/call 'arguments' must be an object",
+            )
             raise JsonRpcError(
                 code=-32602,
                 message="Invalid params: tools/call 'arguments' must be an object",
@@ -576,60 +713,387 @@ class SimpleMcpServer:
 
         handler = self._tool_handlers.get(name)
         if handler is None:
+            self._telemetry.emit_pre_dispatch_error(
+                error_code="tool_not_found",
+                requested_tool=name,
+            )
             raise JsonRpcError(code=-32601, message=f"Tool not found: {name}")
 
+        t0 = time.monotonic()
         try:
             payload = handler(arguments)
-            return self._tool_result(payload)
+            result = self._tool_result(payload)
+            self._emit_call_telemetry(
+                tool=name,
+                arguments=arguments,
+                status="ok",
+                error_code=None,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                payload=payload,
+                is_error=False,
+            )
+            return result
         except GhidraBackendError as exc:
-            return self._tool_result({"error": str(exc)}, is_error=True)
+            payload = build_error_payload(exc)
+            self._emit_call_telemetry(
+                tool=name,
+                arguments=arguments,
+                status="error",
+                error_code=payload.get("error_code", "internal"),
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                payload=payload,
+                is_error=True,
+            )
+            return self._tool_result(payload, is_error=True)
         except Exception as exc:  # pragma: no cover - safety net
+            payload = {
+                "error": f"unexpected tool failure: {type(exc).__name__}: {exc}",
+                "error_code": "internal",
+            }
+            self._emit_call_telemetry(
+                tool=name,
+                arguments=arguments,
+                status="error",
+                error_code="internal",
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                payload=payload,
+                is_error=True,
+            )
             return self._tool_result(
-                {"error": f"unexpected tool failure: {type(exc).__name__}: {exc}"},
+                payload,
                 is_error=True,
             )
 
+    def _emit_call_telemetry(
+        self,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+        status: str,
+        error_code: str | None,
+        latency_ms: int,
+        payload: dict[str, Any],
+        is_error: bool,
+    ) -> None:
+        """Emit one telemetry record per tool_call dispatch."""
+        # Serialize payload to measure result_size_bytes; reuse for preview.
+        try:
+            payload_text = json.dumps(payload, default=str)
+        except Exception:
+            payload_text = repr(payload)
+        # pyghidra.exec captures the full code body verbatim.
+        code = arguments.get("code") if tool == "pyghidra.exec" else None
+        # Address-tolerance metadata (phase 2c may inject this on the payload).
+        address_adjusted = payload.get("address_adjusted") if isinstance(payload, dict) else None
+        globals_size_bytes = (
+            payload.get("globals_size_bytes")
+            if tool == "pyghidra.exec" and isinstance(payload, dict)
+            else None
+        )
+        self._telemetry.emit_tool_call(
+            tool=tool,
+            args=arguments,
+            status=status,
+            error_code=error_code,
+            latency_ms=latency_ms,
+            result_size_bytes=len(payload_text),
+            result_preview=payload_text,
+            cached=bool(payload.get("cached")) if isinstance(payload, dict) else False,
+            address_adjusted=address_adjusted,
+            code=code,
+            globals_size_bytes=globals_size_bytes,
+        )
+
     def _make_backend_handler(self, method_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
         backend_method = getattr(self._backend, method_name)
-        signature = inspect.signature(backend_method)
+        # bind_signature is the bound-method signature (no `self`), used to bind args.
+        bind_signature = inspect.signature(backend_method)
+        # class_signature is the canonical signature from the class; we use it to
+        # detect which params accept addresses regardless of whether the instance
+        # is a real GhidraBackend or a test stub with a loose signature.
+        class_signature = inspect.signature(getattr(GhidraBackend, method_name))
+        accepts_session_id = "session_id" in class_signature.parameters
+        # Address-tolerance is only useful where the call requires a function
+        # entry (decompile, disassemble). xrefs.to / xrefs.from accept any
+        # address (including data labels), so tolerance there would wrongly
+        # reject legitimate string/data targets.
+        _TOLERANT_METHODS = {"decomp_function", "disasm_function"}
+        if method_name in _TOLERANT_METHODS:
+            tolerant_params = [
+                p for p in class_signature.parameters
+                if p in ("address", "function_start")
+            ]
+        else:
+            tolerant_params = []
 
         def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            if accepts_session_id and self._auto_session_id is not None:
+                arguments = {**arguments, "session_id": self._auto_session_id}
+
+            address_adjusted: dict[str, Any] | None = None
+            for param_name in tolerant_params:
+                raw = arguments.get(param_name)
+                if raw is None or raw == "":
+                    continue
+                if self._auto_session_id is None:
+                    break  # no session, no tolerance pipeline
+                hit = _resolve_address(self._backend, self._auto_session_id, raw)
+                resolved = hit.get("address")
+                if resolved and str(resolved).lower() != str(raw).lower():
+                    address_adjusted = {
+                        "requested": str(raw),
+                        "resolved": resolved,
+                        "reason": hit.get("reason", hit.get("kind")),
+                    }
+                    if hit.get("via"):
+                        address_adjusted["via"] = hit["via"]
+                    arguments = {**arguments, param_name: resolved}
+
             try:
-                bound = signature.bind(**arguments)
+                bound = bind_signature.bind(**arguments)
             except TypeError as exc:
-                raise GhidraBackendError(str(exc)) from exc
-            return backend_method(*bound.args, **bound.kwargs)
+                raise ToolError(
+                    str(exc), error_code="bad_args", field=None, expected=None
+                ) from exc
+            result = backend_method(*bound.args, **bound.kwargs)
+            if address_adjusted is not None and isinstance(result, dict):
+                result["address_adjusted"] = address_adjusted
+            return result
 
         return handler
 
     def _tool_meta_help(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Return long-form help for a named tool.
+        """Return hand-written long-form help for a named tool."""
+        from . import meta
 
-        Phase 1c: returns the description from `_DESCRIPTION_OVERRIDES` plus the
-        input schema. Phase 2 will replace with hand-written per-tool docs that
-        include parameters, examples, and a pyghidra alternative.
-        """
         name = arguments.get("tool")
         if not isinstance(name, str) or not name:
-            raise GhidraBackendError("meta.help requires a 'tool' string argument")
+            raise ToolError(
+                "meta.help requires a 'tool' string argument",
+                error_code="bad_args",
+                field="tool",
+                expected="string",
+            )
+        entry = meta.get(name)
+        if entry is None:
+            raise ToolError(
+                f"unknown tool: {name}",
+                error_code="not_found_name",
+                field="tool",
+                next_action="call tools/list to see the 12 available tool names",
+            )
+        # Surface the entry verbatim plus the live schema for the agent's reference.
         spec = next((s for s in ALL_TOOL_SPECS if s.get("name") == name), None)
-        if spec is None:
-            raise GhidraBackendError(f"unknown tool: {name}")
         return {
             "tool": name,
-            "description": _DESCRIPTION_OVERRIDES.get(name, _tool_description(name)),
-            "parameters": spec.get("properties", {}),
-            "required": spec.get("required", []),
-            "examples": [],
-            "pyghidra_alternative": "TODO: phase 2 — hand-written per-tool snippet",
+            "description": entry["description"],
+            "parameters": entry["parameters"],
+            "examples": entry["examples"],
+            "pyghidra_alternative": entry["pyghidra_alternative"],
+            "schema": spec.get("properties", {}) if spec else {},
+            "required": spec.get("required", []) if spec else [],
         }
 
-    def _tool_decompile_batch(self, _arguments: dict[str, Any]) -> dict[str, Any]:
-        """Stub. Phase 2 will implement against a refactored single-program backend."""
-        raise GhidraBackendError(
-            "decompile.batch is not yet implemented in this build "
-            "(error_code: unsupported). Call `decompile` once per target."
+    # ---------- binary.summary --------------------------------------------
+
+    def _tool_binary_summary(self, _arguments: dict[str, Any]) -> dict[str, Any]:
+        """Composed binary.summary: upstream metadata + recon script output.
+
+        Cached for the session lifetime (one binary per session; no LRU needed).
+        """
+        from . import binary_summary as bs
+
+        if self._binary_summary_cache is not None:
+            cached = dict(self._binary_summary_cache)
+            cached["cached"] = True
+            return cached
+        upstream = self._backend.binary_summary(self._auto_session_id)
+        raw_recon = self._backend.eval_code(
+            bs.build_recon_script(), session_id=self._auto_session_id
         )
+        recon = raw_recon.get("result") if isinstance(raw_recon, dict) else raw_recon
+        if not isinstance(recon, dict):
+            recon = {}
+        curated = bs.curate(upstream if isinstance(upstream, dict) else {}, recon)
+        self._binary_summary_cache = curated
+        out = dict(curated)
+        out["cached"] = False
+        return out
+
+    # ---------- decompile + decompile.batch -------------------------------
+
+    def _tool_decompile(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Decompile one function with address tolerance + LRU cache."""
+        target = arguments.get("function_start")
+        if target is None or target == "":
+            raise ToolError(
+                "decompile requires a `function_start` argument",
+                error_code="bad_args",
+                field="function_start",
+                expected="hex address or symbol name",
+            )
+        timeout_secs = arguments.get("timeout_secs", 30)
+        max_lines = arguments.get("max_lines")
+        if max_lines is not None and (not isinstance(max_lines, int) or max_lines <= 0):
+            raise ToolError(
+                "max_lines must be a positive integer",
+                error_code="bad_args",
+                field="max_lines",
+                expected="positive integer",
+            )
+        return self._decompile_one(target, timeout_secs=timeout_secs, max_lines=max_lines)
+
+    def _decompile_one(
+        self, target: Any, *, timeout_secs: int, max_lines: int | None = None
+    ) -> dict[str, Any]:
+        """Shared resolver+cache+backend path for `decompile` and `decompile.batch`.
+
+        ``max_lines`` truncates the returned decompile text (applied after the
+        backend call; cached payload remains full-fidelity).
+        """
+        target_str = str(target)
+        hit = _resolve_address(self._backend, self._auto_session_id, target)
+        resolved = hit.get("address", target_str)
+        address_adjusted = None
+        if str(resolved).lower() != target_str.lower():
+            address_adjusted = {
+                "requested": target_str,
+                "resolved": resolved,
+                "reason": hit.get("reason", hit.get("kind")),
+            }
+            if hit.get("via"):
+                address_adjusted["via"] = hit["via"]
+
+        # Cache key: canonical resolved address + timeout. (max_lines truncates
+        # post-cache so the cache stays compatible across different line caps.)
+        cache_key = (resolved, timeout_secs)
+        cached_value = self._decompile_cache.get(cache_key)
+        if cached_value is not None:
+            response = dict(cached_value)
+            response["cached"] = True
+            if address_adjusted is not None:
+                response["address_adjusted"] = address_adjusted
+            return _apply_max_lines(response, max_lines)
+
+        raw = self._backend.decomp_function(
+            self._auto_session_id, resolved, timeout_secs=timeout_secs
+        )
+        if not isinstance(raw, dict):
+            return _apply_max_lines({"result": raw, "cached": False}, max_lines)
+        # Store the *cacheable* part (drop per-call fields like address_adjusted).
+        cacheable = {k: v for k, v in raw.items() if k != "address_adjusted"}
+        self._decompile_cache.put(cache_key, cacheable)
+        raw["cached"] = False
+        if address_adjusted is not None:
+            raw["address_adjusted"] = address_adjusted
+        return _apply_max_lines(raw, max_lines)
+
+    def _tool_decompile_batch(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Decompile many functions; return a dict keyed by the input target."""
+        targets = arguments.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise ToolError(
+                "decompile.batch requires a non-empty `targets` list",
+                error_code="bad_args",
+                field="targets",
+                expected="non-empty array of strings",
+            )
+        max_lines_each = arguments.get("max_lines_each", 200)
+        if not isinstance(max_lines_each, int) or max_lines_each <= 0:
+            raise ToolError(
+                "max_lines_each must be a positive integer",
+                error_code="bad_args",
+                field="max_lines_each",
+                expected="positive integer",
+            )
+
+        results: dict[str, Any] = {}
+        for target in targets:
+            target_str = str(target)
+            try:
+                results[target_str] = self._decompile_one(
+                    target, timeout_secs=30, max_lines=max_lines_each
+                )
+            except ToolError as exc:
+                results[target_str] = build_error_payload(exc)
+            except GhidraBackendError as exc:
+                results[target_str] = {
+                    "error": str(exc),
+                    "error_code": getattr(exc, "error_code", "internal"),
+                }
+        return {"results": results, "count": len(results)}
+
+    # ---------- pyghidra.exec ---------------------------------------------
+
+    _PYGHIDRA_PRELUDE = (
+        "import tinyghidramcp._pyghidra_session as _tgm_sess\n"
+        "_tgm_sess.inject(globals())\n"
+    )
+    # The postlude runs after the agent's code. It maps agent's `result` (the
+    # documented convention) onto the upstream eval_code's `_` slot, and
+    # persists agent-created globals.
+    _PYGHIDRA_POSTLUDE = (
+        "\nif 'result' in globals(): _ = result\n"
+        "_tgm_globals_size = _tgm_sess.persist(globals())\n"
+    )
+
+    def _tool_pyghidra_exec(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute arbitrary Python with persistent globals and bound aliases."""
+        import ast
+        import time
+
+        from . import _pyghidra_session
+
+        code = arguments.get("code")
+        if not isinstance(code, str) or not code:
+            raise ToolError(
+                "pyghidra.exec requires non-empty 'code'",
+                error_code="bad_args",
+                field="code",
+                expected="string",
+            )
+        # Auto-detect expression vs script. If the whole agent block parses as
+        # a single expression, capture its value as `_` for the upstream eval
+        # path. Otherwise run as a script; agents can set `result = ...`.
+        try:
+            ast.parse(code, mode="eval")
+            agent_block = "_ = " + code.strip()
+        except SyntaxError:
+            agent_block = code
+        wrapped = self._PYGHIDRA_PRELUDE + agent_block + self._PYGHIDRA_POSTLUDE
+        t0 = time.monotonic()
+        try:
+            raw = self._backend.eval_code(wrapped, session_id=self._auto_session_id)
+        except GhidraBackendError as exc:
+            raise ToolError(str(exc), error_code="internal") from exc
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        # Pull globals_size_bytes out of the eval context if the postlude wrote it.
+        # (The upstream doesn't surface arbitrary variables, but it does include
+        # stdout/stderr. We instead rely on _pyghidra_session.STATE size after persist.)
+        globals_size_bytes = _pyghidra_session._approx_size(_pyghidra_session.STATE)
+
+        result_payload = raw.get("result") if isinstance(raw, dict) else raw
+        wrote_program = bool(raw.get("mode_transitioned")) if isinstance(raw, dict) else False
+        invalidate_requested = _pyghidra_session.pop_invalidate_request()
+        # Flush decompile cache when state may have changed.
+        flushed_entries = 0
+        if invalidate_requested or wrote_program:
+            flushed_entries = self._decompile_cache.invalidate()
+        payload: dict[str, Any] = {
+            "result": result_payload,
+            "duration_ms": duration_ms,
+            "globals_size_bytes": globals_size_bytes,
+            "wrote_program": wrote_program,
+            "cache_invalidate_requested": invalidate_requested,
+            "decompile_cache_flushed_entries": flushed_entries,
+        }
+        if isinstance(raw, dict):
+            if raw.get("stdout"):
+                payload["stdout"] = raw["stdout"]
+            if raw.get("stderr"):
+                payload["stderr"] = raw["stderr"]
+        return payload
 
     @staticmethod
     def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
