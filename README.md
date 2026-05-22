@@ -37,7 +37,7 @@ observed agent traffic; everything else routes through `pyghidra.exec`.
 
 ## Operational model
 
-tinyghidramcp expects revbench's container model:
+tinyghidramcp expects the following implementation:
 
 - One server process = one agent run = one Ghidra program loaded.
 - The warmed Ghidra project is at the hardcoded path `/var/lib/tinyghidramcp/project/`,
