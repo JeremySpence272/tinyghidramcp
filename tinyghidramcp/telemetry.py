@@ -100,7 +100,13 @@ class Telemetry:
         ghidra_version: str | None = None,
         git_sha: str | None = None,
         binary_path: str | None = None,
+        bootstrap_status: str = "ok",
+        bootstrap_error: str | None = None,
     ) -> None:
+        """Single shape for every session-start record. ``bootstrap_status`` is
+        "ok" on success, "failed" if the warmed-project open didn't work.
+        Analyzer reads the first line of every JSONL session file and inspects
+        this field to know whether to expect further records."""
         self.emit(
             {
                 "event": "session_start",
@@ -108,16 +114,8 @@ class Telemetry:
                 "tinyghidramcp_git_sha": git_sha,
                 "binary_path": binary_path,
                 "binary_sha256": _sha256_of_file(binary_path) if binary_path else None,
-            }
-        )
-
-    def emit_session_start_failed(self, error: str) -> None:
-        self.emit(
-            {
-                "event": "session_start_failed",
-                "status": "error",
-                "error_code": "state",
-                "error": error,
+                "bootstrap_status": bootstrap_status,
+                "bootstrap_error": bootstrap_error,
             }
         )
 

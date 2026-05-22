@@ -18,7 +18,7 @@ def test_name_resolves_to_function_via_symbol_lookup(server, stub_backend):
         "kind": "exact", "reason": "symbol_lookup",
         "address": "0x401234", "name": "main",
     }
-    r = _call(server, "decompile", {"function_start": "main"})
+    r = _call(server, "decompile", {"target": "main"})
     assert r["isError"] is False
     adj = r["structuredContent"]["address_adjusted"]
     assert adj == {"requested": "main", "resolved": "0x401234", "reason": "symbol_lookup"}
@@ -29,7 +29,7 @@ def test_name_not_found_returns_structured_error(server, stub_backend):
         "kind": "miss", "reason": "name_not_found",
         "is_code": False, "in_section": None, "name": "nope",
     }
-    r = _call(server, "decompile", {"function_start": "nope"})
+    r = _call(server, "decompile", {"target": "nope"})
     sc = r["structuredContent"]
     assert r["isError"] is True
     assert sc["error_code"] == "not_found_name"

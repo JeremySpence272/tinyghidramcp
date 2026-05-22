@@ -20,6 +20,40 @@ DECOMPILE_HARD_CEILING_LINES = 4000
 DECOMPILE_DEFAULT_LINES = 800
 
 
+# Ghidra reference_type strings that we count as "code" (control flow + the
+# basic-block / sub-flow varieties). Everything else (READ/WRITE/DATA/POINTER
+# variants, parameter-type, indirection, etc.) is treated as data.
+_CODE_REF_TYPES: frozenset[str] = frozenset({
+    "UNCONDITIONAL_CALL",
+    "CONDITIONAL_CALL",
+    "COMPUTED_CALL",
+    "COMPUTED_CALL_TERMINATOR",
+    "CALLOTHER_OVERRIDE_CALL",
+    "UNCONDITIONAL_JUMP",
+    "CONDITIONAL_JUMP",
+    "COMPUTED_JUMP",
+    "CONDITIONAL_COMPUTED_JUMP",
+    "CONDITIONAL_COMPUTED_CALL",
+    "CALLOTHER_OVERRIDE_JUMP",
+    "FALL_THROUGH",
+    "TERMINATOR",
+    "CALL_OVERRIDE_UNCONDITIONAL",
+    "JUMP_OVERRIDE_UNCONDITIONAL",
+    "INDIRECTION",
+    "INVALID",
+    "CALLOTHER_RETURN",
+})
+
+
+def _is_data_reference(item: dict[str, Any]) -> bool:
+    """True if a reference record represents a data (not code) cross-ref."""
+    ref_type = str(item.get("reference_type") or "").upper()
+    if not ref_type:
+        return False
+    # Anything that isn't on the code-flow whitelist is data.
+    return ref_type not in _CODE_REF_TYPES
+
+
 def _apply_max_lines(payload: dict, max_lines: int | None) -> dict:
     """Truncate the `decompiled` / `result` text in a decompile payload.
 
@@ -46,16 +80,25 @@ _ADDRESS_SCHEMA: dict[str, Any] = {
 }
 
 _PYGHIDRA_CTA = (
-    " If your use case isn't covered by the available named tools, drop to "
+    "If your use case isn't covered by the available named tools, drop to "
     "`pyghidra.exec` for full Ghidra Python API access."
 )
+
+
+def _with_cta(desc: str) -> str:
+    """Append the pyghidra.exec CTA to a tool description.
+
+    Strips any trailing period/whitespace and rejoins with ". " so a missing
+    or extra terminator on the caller side doesn't produce a broken sentence.
+    """
+    return desc.rstrip(" .") + ". " + _PYGHIDRA_CTA
 
 _SERVER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "meta.help",
-        "description": (
+        "description": _with_cta(
             "Return long-form documentation, parameters, examples, and a `pyghidra.exec` "
-            "alternative for a named tool." + _PYGHIDRA_CTA
+            "alternative for a named tool."
         ),
         "properties": {"tool": {"type": "string"}},
         "required": ["tool"],
@@ -63,9 +106,9 @@ _SERVER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "decompile.batch",
-        "description": (
+        "description": _with_cta(
             "Decompile many functions in one call. Returns a dict keyed by the input target "
-            "string (whatever the agent passed for each target). Order irrelevant." + _PYGHIDRA_CTA
+            "string (whatever the agent passed for each target). Order irrelevant."
         ),
         "properties": {
             "targets": {"type": "array", "items": {"type": "string"}},
@@ -95,51 +138,60 @@ _BACKEND_TOOL_NAME_MAP: dict[str, str] = {
 
 # Tool descriptions. All named-tool descriptions end with the pyghidra CTA so
 # agents are reminded of the escape hatch every time they read tools/list.
-_DESCRIPTION_OVERRIDES: dict[str, str] = {
+# Edit `_BASE_DESCRIPTIONS` below; the CTA is appended automatically. The one
+# exception is `pyghidra.exec` itself -- it's the CTA target, so it doesn't
+# advertise itself in its own description.
+_BASE_DESCRIPTIONS: dict[str, str] = {
     "binary.summary": (
         "Return the open program's architecture, endianness, image base, entry, sections, "
         "dynamic deps, security flags (RELRO/NX/PIE/canary/stripped), runtime/language hint, "
-        "and top symbols sorted by xref count." + _PYGHIDRA_CTA
+        "and top symbols sorted by xref count."
     ),
     "search.functions": (
-        "Search functions by name (regex). Returns name, entry address, signature." + _PYGHIDRA_CTA
+        "Search functions by name (regex). Returns name, entry address, signature."
     ),
     "search.strings": (
-        "Search defined strings by content. Supports min-length filter and encoding." + _PYGHIDRA_CTA
+        "Search defined strings by content. Supports min-length filter and encoding."
     ),
     "decompile": (
         "Decompile one function. `target` is a hex address or symbol name; the server "
-        "auto-detects and applies address tolerance (mid-function, PLT, unanalysed)." + _PYGHIDRA_CTA
+        "auto-detects and applies address tolerance (mid-function, PLT, unanalysed)."
     ),
     "decompile.batch": (
-        "Decompile many functions in one call. Returns a dict keyed by the input target." + _PYGHIDRA_CTA
+        "Decompile many functions in one call. Returns a dict keyed by the input target."
     ),
     "disassemble": (
         "Disassemble a function or address range. Lines include absolute addresses and "
-        "demangled symbols." + _PYGHIDRA_CTA
+        "demangled symbols."
     ),
     "xrefs.to": (
-        "Find code references TO an address. Set include_data=true for data refs too." + _PYGHIDRA_CTA
+        "Find code references TO an address. Set include_data=true to include data refs."
     ),
     "xrefs.from": (
-        "Find code references FROM an address. Set include_data=true for data refs too." + _PYGHIDRA_CTA
+        "Find code references FROM an address. Set include_data=true to include data refs."
     ),
     "callgraph": (
-        "Bounded call-graph traversal. Returns flat edge list (caller, callee, callsite)." + _PYGHIDRA_CTA
+        "Bounded call-graph traversal. Returns flat edge list (caller, callee, callsite)."
     ),
     "resolve": (
-        "Resolve a symbol name or expression into one or more candidate addresses." + _PYGHIDRA_CTA
+        "Resolve a symbol name or expression into one or more candidate addresses."
     ),
+    "meta.help": (
+        "Return long-form documentation for a named tool, with parameter descriptions, "
+        "example invocations, and a copy-pasteable pyghidra.exec alternative."
+    ),
+    # pyghidra.exec: no CTA suffix (don't tell the agent to call the tool they're already in).
     "pyghidra.exec": (
         "Run arbitrary Python with currentProgram, currentAddress, monitor, flatAPI, "
         "decompAPI, listing, fm, sm, mem, and cache bound. Globals persist between calls. "
         "No sandbox. This runs as root in the agent's container with full filesystem and "
         "Ghidra API access."
     ),
-    "meta.help": (
-        "Return long-form documentation for a named tool, with parameter descriptions, "
-        "example invocations, and a copy-pasteable pyghidra.exec alternative." + _PYGHIDRA_CTA
-    ),
+}
+
+_DESCRIPTION_OVERRIDES: dict[str, str] = {
+    name: (desc if name == "pyghidra.exec" else _with_cta(desc))
+    for name, desc in _BASE_DESCRIPTIONS.items()
 }
 
 _ADDRESS_PARAM_NAMES = {
@@ -260,10 +312,25 @@ def _build_backend_tool_specs() -> tuple[dict[str, Any], ...]:
 
 
 def _augment_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    """Patch auto-generated specs where the custom handler accepts extra args."""
+    """Patch auto-generated specs where the custom handler accepts extra args
+    or where we want the agent-facing argument name to differ from the
+    backend's internal name."""
     if spec["name"] == "decompile":
-        # Custom handler accepts max_lines on top of the upstream signature.
-        spec["properties"]["max_lines"] = {"type": "integer"}
+        # Agent-facing arg is `target` (auto-detects address vs symbol name);
+        # the backend's internal name is `function_start`. Handler translates
+        # before dispatch.
+        props = spec["properties"]
+        if "function_start" in props:
+            props["target"] = props.pop("function_start")
+        spec["required"] = [
+            "target" if r == "function_start" else r for r in spec.get("required", [])
+        ]
+        # Custom handler also accepts max_lines (truncates the decompile body).
+        props["max_lines"] = {"type": "integer"}
+    elif spec["name"] in ("xrefs.to", "xrefs.from"):
+        # Custom handler accepts include_data on top of the upstream signature.
+        # Default false: only code references are returned.
+        spec["properties"]["include_data"] = {"type": "boolean"}
     return spec
 
 
@@ -308,6 +375,16 @@ class SimpleMcpServer:
         from .decompile_cache import DecompileCache
         from .telemetry import Telemetry, from_env
 
+        # Defense-in-depth: catch typos in _BACKEND_TOOL_NAME_MAP that the
+        # module-load check (`_build_backend_tool_specs`) can't see, e.g. when
+        # a test passes a stub backend missing one of the mapped methods.
+        missing = [name for name in _BACKEND_TOOL_NAME_MAP if not hasattr(backend, name)]
+        if missing:
+            raise RuntimeError(
+                "backend instance missing methods mapped by _BACKEND_TOOL_NAME_MAP: "
+                + ", ".join(missing)
+            )
+
         self._backend = backend
         self._auto_session_id: str | None = None
         self._telemetry: Telemetry = telemetry if telemetry is not None else from_env()
@@ -328,6 +405,11 @@ class SimpleMcpServer:
             elif spec["name"] == "binary.summary":
                 # Custom wrapper: composes upstream + recon script into curated response.
                 self._tool_handlers[spec["name"]] = self._tool_binary_summary
+            elif spec["name"] in ("xrefs.to", "xrefs.from"):
+                # Custom wrapper: accept include_data flag (default false).
+                self._tool_handlers[spec["name"]] = self._make_xrefs_handler(
+                    spec["backend_method"]
+                )
             else:
                 self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
 
@@ -336,6 +418,8 @@ class SimpleMcpServer:
 
         Called once at server startup by the CLI. Raises RuntimeError if the
         warmed project is missing or doesn't contain exactly one program.
+        Also kicks off a background pre-decompile of the entry function to
+        warm the decompiler cache before the agent's first call lands.
         """
         import os
 
@@ -354,6 +438,23 @@ class SimpleMcpServer:
             read_only=True,
         )
         self._auto_session_id = result["session_id"]
+        self._warm_entry_decompile()
+
+    def _warm_entry_decompile(self) -> None:
+        """Fire-and-forget pre-decompile of the entry function on a background
+        thread. The result lands in the decompile cache; we discard the return
+        value. Any failure is silently ignored — this is opportunistic warmup."""
+        import threading
+
+        def _warm() -> None:
+            try:
+                self._decompile_one(
+                    "entry", timeout_secs=30, max_lines=None
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_warm, name="tgm-warmup", daemon=True).start()
 
     def _discover_only_program(self) -> str:
         from ghidra.base.project import GhidraProject  # type: ignore[import-not-found]
@@ -804,13 +905,34 @@ class SimpleMcpServer:
             globals_size_bytes=globals_size_bytes,
         )
 
+    def _make_xrefs_handler(
+        self, method_name: str
+    ) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        """Handler for xrefs.to / xrefs.from. Pops `include_data` (default False),
+        calls the upstream method, and filters the response."""
+        base_handler = self._make_backend_handler(method_name)
+
+        def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+            include_data = bool(arguments.pop("include_data", False))
+            result = base_handler(arguments)
+            if not isinstance(result, dict) or include_data:
+                return result
+            items = result.get("items")
+            if isinstance(items, list):
+                kept = [item for item in items if not _is_data_reference(item)]
+                result = dict(result)
+                result["items"] = kept
+                result["count"] = len(kept)
+                result.setdefault("filtered_out", "data refs (include_data=false)")
+            return result
+
+        return handler
+
     def _make_backend_handler(self, method_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
-        backend_method = getattr(self._backend, method_name)
-        # bind_signature is the bound-method signature (no `self`), used to bind args.
-        bind_signature = inspect.signature(backend_method)
-        # class_signature is the canonical signature from the class; we use it to
-        # detect which params accept addresses regardless of whether the instance
-        # is a real GhidraBackend or a test stub with a loose signature.
+        # Resolve the backend method per-call rather than capturing at handler-
+        # construction time. Lets tests rebind stub methods between calls,
+        # and is harmless in production (the real backend never rebinds).
+        # The class signature is the canonical schema source.
         class_signature = inspect.signature(getattr(GhidraBackend, method_name))
         accepts_session_id = "session_id" in class_signature.parameters
         # Address-tolerance is only useful where the call requires a function
@@ -849,6 +971,8 @@ class SimpleMcpServer:
                         address_adjusted["via"] = hit["via"]
                     arguments = {**arguments, param_name: resolved}
 
+            backend_method = getattr(self._backend, method_name)
+            bind_signature = inspect.signature(backend_method)
             try:
                 bound = bind_signature.bind(**arguments)
             except TypeError as exc:
@@ -924,12 +1048,12 @@ class SimpleMcpServer:
 
     def _tool_decompile(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Decompile one function with address tolerance + LRU cache."""
-        target = arguments.get("function_start")
+        target = arguments.get("target")
         if target is None or target == "":
             raise ToolError(
-                "decompile requires a `function_start` argument",
+                "decompile requires a `target` argument",
                 error_code="bad_args",
-                field="function_start",
+                field="target",
                 expected="hex address or symbol name",
             )
         timeout_secs = arguments.get("timeout_secs", 30)

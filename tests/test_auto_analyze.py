@@ -18,7 +18,7 @@ def shorter_cap(monkeypatch):
 
 def _call_decompile(server, addr):
     req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-           "params": {"name": "decompile", "arguments": {"function_start": addr}}}
+           "params": {"name": "decompile", "arguments": {"target": addr}}}
     return json.loads(server.handle_json_line(json.dumps(req)))["result"]
 
 

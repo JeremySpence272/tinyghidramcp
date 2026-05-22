@@ -35,12 +35,12 @@ def test_cache_unit_lru_eviction():
 def test_decompile_first_call_misses_second_hits(server, stub_backend):
     stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
     # First call -> cached=False
-    r1 = _call(server, "decompile", {"function_start": "0x401234"})
+    r1 = _call(server, "decompile", {"target": "0x401234"})
     sc1 = r1["structuredContent"]
     assert sc1["cached"] is False
 
     # Second call -> cached=True. Stub returns the same resolver response.
-    r2 = _call(server, "decompile", {"function_start": "0x401234"})
+    r2 = _call(server, "decompile", {"target": "0x401234"})
     sc2 = r2["structuredContent"]
     assert sc2["cached"] is True
 
@@ -51,14 +51,14 @@ def test_two_different_inputs_resolving_to_same_addr_share_cache(server, stub_ba
     stub_backend.next_eval_response = {
         "kind": "exact", "reason": "symbol_lookup", "address": "0x401234", "name": "main",
     }
-    r1 = _call(server, "decompile", {"function_start": "main"})
+    r1 = _call(server, "decompile", {"target": "main"})
     assert r1["structuredContent"]["cached"] is False
 
     # Second request: hex address that resolves to the same function
     stub_backend.next_eval_response = {
         "kind": "exact", "address": "0x401234", "name": "main",
     }
-    r2 = _call(server, "decompile", {"function_start": "0x401234"})
+    r2 = _call(server, "decompile", {"target": "0x401234"})
     assert r2["structuredContent"]["cached"] is True
 
 
@@ -66,7 +66,7 @@ def test_pyghidra_exec_cache_invalidate_flushes_decompile_cache(server, stub_bac
     """Wire-up: when pyghidra.exec calls cache.invalidate(), decompile cache empties."""
     # Prime cache
     stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
-    _call(server, "decompile", {"function_start": "0x401234"})
+    _call(server, "decompile", {"target": "0x401234"})
     assert server._decompile_cache.entries == 1
 
     # The stub's eval_code ignores the wrapped script; flip the invalidate flag

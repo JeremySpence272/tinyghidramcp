@@ -59,6 +59,41 @@ def test_pre_dispatch_tool_not_found(telemetry_dir, stub_backend):
     assert rec["requested_tool"] == "no.such.tool"
 
 
+def test_pre_dispatch_validation_error_on_non_string_name(telemetry_dir, stub_backend):
+    """When tools/call is sent with `name` as a non-string, the server emits a
+    pre-dispatch validation_error record (tool=null) before refusing the call."""
+    t = from_env()
+    srv = SimpleMcpServer(stub_backend, telemetry=t)
+    srv.handle_json_line(json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": 42, "arguments": {}},
+    }))
+    t.close()
+    rec = _read_jsonl(_telemetry_path(telemetry_dir))[-1]
+    assert rec["status"] == "pre_dispatch_error"
+    assert rec["error_code"] == "validation_error"
+    assert rec["tool"] is None
+    assert rec["validation_field"] == "name"
+    assert rec["validation_expected"] == "string"
+
+
+def test_pre_dispatch_validation_error_on_non_object_arguments(telemetry_dir, stub_backend):
+    """Same shape when `arguments` is the wrong type."""
+    t = from_env()
+    srv = SimpleMcpServer(stub_backend, telemetry=t)
+    srv.handle_json_line(json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "decompile", "arguments": "not-an-object"},
+    }))
+    t.close()
+    rec = _read_jsonl(_telemetry_path(telemetry_dir))[-1]
+    assert rec["status"] == "pre_dispatch_error"
+    assert rec["error_code"] == "validation_error"
+    assert rec["tool"] == "decompile"
+    assert rec["validation_field"] == "arguments"
+    assert rec["validation_expected"] == "object"
+
+
 def test_tool_call_records_args_and_status(telemetry_dir, stub_backend):
     t = from_env()
     srv = SimpleMcpServer(stub_backend, telemetry=t)
@@ -66,14 +101,14 @@ def test_tool_call_records_args_and_status(telemetry_dir, stub_backend):
     stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
     srv.handle_json_line(json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "decompile", "arguments": {"function_start": "0x401234"}},
+        "params": {"name": "decompile", "arguments": {"target": "0x401234"}},
     }))
     t.close()
     records = _read_jsonl(_telemetry_path(telemetry_dir))
     tool_call = next(r for r in records if r["event"] == "tool_call" and r.get("tool") == "decompile")
     assert tool_call["status"] == "ok"
     assert tool_call["error_code"] is None
-    assert tool_call["args"] == {"function_start": "0x401234"}
+    assert tool_call["args"] == {"target": "0x401234"}
 
 
 def test_pyghidra_exec_captures_full_code_body(telemetry_dir, stub_backend):
@@ -123,7 +158,7 @@ def test_error_telemetry_carries_error_code(telemetry_dir, stub_backend):
     }
     srv.handle_json_line(json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "decompile", "arguments": {"function_start": "0x401abc"}},
+        "params": {"name": "decompile", "arguments": {"target": "0x401abc"}},
     }))
     t.close()
     rec = next(

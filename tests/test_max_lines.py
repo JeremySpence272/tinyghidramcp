@@ -53,14 +53,14 @@ def test_decompile_max_lines_wired_through(server, stub_backend):
         "decompiled": LONG_DECOMPILE,
         "function_name": "main",
     }
-    r = _call(server, "decompile", {"function_start": "0x401234", "max_lines": 50})
+    r = _call(server, "decompile", {"target": "0x401234", "max_lines": 50})
     sc = r["structuredContent"]
     assert sc["max_lines_applied"] == 50
     assert sc["decompiled"].count("\n") == 49
 
 
 def test_decompile_max_lines_rejects_bad_arg(server):
-    r = _call(server, "decompile", {"function_start": "0x401234", "max_lines": "lots"})
+    r = _call(server, "decompile", {"target": "0x401234", "max_lines": "lots"})
     sc = r["structuredContent"]
     assert r["isError"] is True
     assert sc["error_code"] == "bad_args"

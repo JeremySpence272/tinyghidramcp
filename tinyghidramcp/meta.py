@@ -84,7 +84,7 @@ DOCS: dict[str, dict[str, Any]] = {
     },
     "decompile": {
         "description": (
-            "Decompile one function. `function_start` accepts a hex address "
+            "Decompile one function. `target` accepts a hex address "
             "(`0x401234` or `401234`) or a symbol name (`main`, `main.main`, `_Znwm`). "
             "The server auto-resolves: if you pass an address inside a function, it "
             "decompiles the containing function and tells you via `address_adjusted`. "
@@ -93,13 +93,13 @@ DOCS: dict[str, dict[str, Any]] = {
             "`pyghidra_hint` for the agent's next move."
         ),
         "parameters": [
-            {"name": "function_start", "type": "string", "description": "Hex address or symbol name", "required": True},
+            {"name": "target", "type": "string", "description": "Hex address or symbol name", "required": True},
             {"name": "timeout_secs", "type": "integer", "description": "Decompiler timeout (default 30)", "required": False},
             {"name": "max_lines", "type": "integer", "description": "Truncate to this many lines (default 800; hard ceiling 4000)", "required": False},
         ],
         "examples": [
-            {"args": {"function_start": "main"}, "result_summary": "decompiles `main`; address_adjusted shows symbol_lookup"},
-            {"args": {"function_start": "0x40123a"}, "result_summary": "mid-function offset; adjusts to containing function entry"},
+            {"args": {"target": "main"}, "result_summary": "decompiles `main`; address_adjusted shows symbol_lookup"},
+            {"args": {"target": "0x40123a"}, "result_summary": "mid-function offset; adjusts to containing function entry"},
         ],
         "pyghidra_alternative": (
             "decompAPI.decompileFunction(fm.getFunctionAt(toAddr(0x401234)), 30, monitor).getDecompiledFunction().getC()"

@@ -101,19 +101,27 @@ def main(argv: list[str] | None = None) -> int:
     backend = build_backend()
     server = SimpleMcpServer(backend, telemetry=telemetry)
 
+    # Every session file starts with exactly one `session_start` record.
+    # `bootstrap_status` distinguishes success ("ok") from failure ("failed")
+    # so the analyzer can read the first line and know which path was taken.
+    bootstrap_error: str | None = None
     try:
         server.bootstrap_program()
     except Exception as exc:
-        telemetry.emit_session_start_failed(error=str(exc))
-        telemetry.close()
-        print(f"tinyghidramcp: failed to open warmed project: {exc}", file=sys.stderr)
-        return 2
+        bootstrap_error = str(exc)
 
     telemetry.emit_session_start(
         ghidra_version=_ghidra_version_from_install_dir(),
         git_sha=_git_sha_at_runtime(),
         binary_path=SimpleMcpServer.BINARY_PATH,
+        bootstrap_status="ok" if bootstrap_error is None else "failed",
+        bootstrap_error=bootstrap_error,
     )
+
+    if bootstrap_error is not None:
+        telemetry.close()
+        print(f"tinyghidramcp: failed to open warmed project: {bootstrap_error}", file=sys.stderr)
+        return 2
 
     try:
         server.serve_stdio()

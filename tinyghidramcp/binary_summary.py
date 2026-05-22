@@ -171,6 +171,10 @@ def curate(
 ) -> dict[str, Any]:
     """Merge upstream basic metadata with the recon script's output."""
     # Pull the canonical fields from upstream, drop session_id (server hides it).
+    # Note: a `runtime_image_base` field would belong here when/if we support
+    # rebasing -- in headless mode without rebase, file image base == runtime
+    # image base, so a second field would be a lie. Add it back if/when we
+    # expose `program.image_base.set`.
     out: dict[str, Any] = {
         "filename": upstream.get("filename"),
         "format": upstream.get("format"),
@@ -178,7 +182,6 @@ def curate(
         "compiler_spec_id": upstream.get("compiler_spec_id"),
         "entry_point": upstream.get("entry_point"),
         "image_base": upstream.get("image_base"),
-        "image_base_runtime": upstream.get("image_base"),  # same in headless without rebase
         "min_address": upstream.get("min_address"),
         "max_address": upstream.get("max_address"),
         "read_only": upstream.get("read_only"),

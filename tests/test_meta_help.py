@@ -23,7 +23,7 @@ def test_meta_help_returns_doc_entry(server):
     sc = r["structuredContent"]
     assert r["isError"] is False
     assert sc["tool"] == "decompile"
-    assert "function_start" in str(sc["parameters"])
+    assert "target" in str(sc["parameters"])
     assert len(sc["examples"]) >= 1
     assert "decompAPI" in sc["pyghidra_alternative"]
 

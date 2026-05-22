@@ -97,7 +97,7 @@ def test_live_decompile_main_or_entry(live_server):
     last_exc = None
     for candidate in candidates:
         try:
-            payload = handler({"function_start": candidate})
+            payload = handler({"target": candidate})
             assert isinstance(payload, dict)
             assert "cached" in payload  # confirms the decompile cache wrapped the call
             return  # one success is enough
