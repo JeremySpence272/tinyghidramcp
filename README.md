@@ -10,9 +10,7 @@ in active reduction. See `NOTICE.md` for attribution.
 
 ## Design
 
-The tool surface was selected from a corpus of ~290 real agent runs (claude / codex)
-against Ghidra MCP servers, analyzed in `../analysis/`. Twelve tools cover ~95% of
-observed agent traffic; everything else routes through `pyghidra.exec`.
+Twelve tools cover majority of observed agent traffic; backup uses pyghidra and allows arbitrary scripting routing through `pyghidra.exec`.
 
 | Tool                | Purpose                                                            |
 |---------------------|--------------------------------------------------------------------|
