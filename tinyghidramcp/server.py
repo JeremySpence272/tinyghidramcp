@@ -171,7 +171,10 @@ _BASE_DESCRIPTIONS: dict[str, str] = {
         "Find code references FROM an address. Set include_data=true to include data refs."
     ),
     "callgraph": (
-        "Bounded call-graph traversal. Returns flat edge list (caller, callee, callsite)."
+        "Find call-graph paths BETWEEN two specific functions. Requires both "
+        "`source_function` AND `target_function` (this is NOT an open-ended outbound "
+        "walk -- use `xrefs.from` for `what does X call?`, or `pyghidra.exec` for "
+        "deeper traversal). Returns paths as flat (caller, callee, callsite) edges."
     ),
     "resolve": (
         "Resolve a symbol name or expression into one or more candidate addresses."
@@ -920,10 +923,18 @@ class SimpleMcpServer:
             items = result.get("items")
             if isinstance(items, list):
                 kept = [item for item in items if not _is_data_reference(item)]
+                dropped = len(items) - len(kept)
                 result = dict(result)
                 result["items"] = kept
                 result["count"] = len(kept)
-                result.setdefault("filtered_out", "data refs (include_data=false)")
+                # Only annotate if we actually filtered anything; an empty result
+                # plus a "filtered_out" marker would falsely suggest adding
+                # include_data would surface more.
+                if dropped > 0:
+                    result["filtered_out"] = {
+                        "count": dropped,
+                        "reason": "data refs (include_data=false)",
+                    }
             return result
 
         return handler

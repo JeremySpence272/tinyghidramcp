@@ -54,6 +54,33 @@ def test_curate_merges_upstream_and_recon():
     assert out["top_symbols"][0]["name"] == "main"
 
 
+def test_recon_overrides_upstream_entry_point_when_upstream_null():
+    """Upstream returns null entry_point on stripped binaries; recon's
+    symbol-table fallback (`_start`/`entry`/`main`) must take precedence."""
+    upstream = {**UPSTREAM_FIXTURE, "entry_point": None}
+    recon = {**RECON_FIXTURE, "entry_point": "0x104860"}
+    out = curate(upstream, recon)
+    assert out["entry_point"] == "0x104860"
+
+
+def test_recon_overrides_max_address_when_overlay_leaks():
+    """Upstream's max_address can read from Ghidra's OTHER overlay
+    (`_elfSectionHeaders::...`); recon restricts to default address space
+    and must take precedence."""
+    upstream = {**UPSTREAM_FIXTURE, "max_address": "_elfSectionHeaders::000009bf"}
+    recon = {**RECON_FIXTURE, "max_address": "0x13ffff"}
+    out = curate(upstream, recon)
+    assert out["max_address"] == "0x13ffff"
+
+
+def test_upstream_value_kept_when_recon_returned_none():
+    """If recon failed to compute a value, fall back to whatever upstream gave."""
+    upstream = {**UPSTREAM_FIXTURE, "entry_point": "0x401050"}
+    recon = {**RECON_FIXTURE, "entry_point": None}
+    out = curate(upstream, recon)
+    assert out["entry_point"] == "0x401050"
+
+
 def _call(server, args=None):
     req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": "binary.summary", "arguments": args or {}}}

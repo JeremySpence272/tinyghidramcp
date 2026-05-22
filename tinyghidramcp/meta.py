@@ -184,14 +184,16 @@ DOCS: dict[str, dict[str, Any]] = {
     },
     "callgraph": {
         "description": (
-            "Bounded call-graph traversal between two functions. Returns a flat list of "
-            "`(caller_addr, callee_addr, callsite_addr, callee_name)` edges. Use when "
-            "you need to understand how control flows from one function to another "
-            "without N round-trips through `xrefs.from`."
+            "Find call-graph paths BETWEEN two specific functions. This is point-to-point: "
+            "you supply both `source_function` AND `target_function`, and the tool returns "
+            "the paths connecting them as flat (caller_addr, callee_addr, callsite_addr, "
+            "callee_name) edges. This is NOT an outbound walk -- if you want to know "
+            "`what does X call?` use `xrefs.from`; for `who calls X?` use `xrefs.to`. "
+            "For arbitrary-depth or filtered traversal, use `pyghidra.exec`."
         ),
         "parameters": [
-            {"name": "source_function", "type": "string", "description": "Hex address or name of starting function", "required": True},
-            {"name": "target_function", "type": "string", "description": "Hex address or name of ending function", "required": True},
+            {"name": "source_function", "type": "string", "description": "Hex address or name of starting function (REQUIRED)", "required": True},
+            {"name": "target_function", "type": "string", "description": "Hex address or name of ending function (REQUIRED)", "required": True},
             {"name": "max_depth", "type": "integer", "description": "Max edges to traverse (default 4)", "required": False},
             {"name": "limit", "type": "integer", "description": "Max paths returned", "required": False},
         ],
@@ -201,7 +203,20 @@ DOCS: dict[str, dict[str, Any]] = {
                 "result_summary": "paths from main to system, including intermediate calls",
             }
         ],
-        "pyghidra_alternative": "(traverse fm.getReferenceManager() manually; non-trivial)",
+        "pyghidra_alternative": (
+            "# outbound walk from main, depth 3:\n"
+            "from collections import deque\n"
+            "start = fm.getFunctionAt(toAddr('0x401234'))\n"
+            "visited = set(); q = deque([(start, 0)]); edges = []\n"
+            "while q:\n"
+            "    fn, d = q.popleft()\n"
+            "    if d >= 3 or fn in visited: continue\n"
+            "    visited.add(fn)\n"
+            "    for callee in fn.getCalledFunctions(monitor):\n"
+            "        edges.append((fn.getName(), callee.getName()))\n"
+            "        q.append((callee, d+1))\n"
+            "result = edges"
+        ),
     },
     "resolve": {
         "description": (

@@ -22,9 +22,55 @@ _RECON_SCRIPT = textwrap.dedent(
     sm = program.getSymbolTable()
     mem = program.getMemory()
     ref_mgr = program.getReferenceManager()
+    default_space = program.getAddressFactory().getDefaultAddressSpace()
 
     def _addr_str(a):
         return "0x%x" % a.getOffset()
+
+    # ---- entry_point (upstream's value can be null on stripped binaries) ---
+    # Try, in order:
+    #   1) flatProgramAPI.getEntryPoint() if available via record (upstream did this)
+    #   2) addressed by `_start` symbol
+    #   3) any other symbol named `entry` / `main`
+    #   4) options(.Program Information).get(ENTRY POINT)
+    entry_point = None
+    for entry_name in ("_start", "entry", "main"):
+        syms = list(sm.getGlobalSymbols(entry_name))
+        if not syms:
+            syms = list(sm.getSymbols(entry_name))
+        for s in syms:
+            if s.getAddress().getAddressSpace() == default_space:
+                entry_point = _addr_str(s.getAddress())
+                break
+        if entry_point:
+            break
+    if entry_point is None:
+        # Last resort: iterate external entry points.
+        try:
+            for addr in sm.getExternalEntryPointIterator():
+                if addr.getAddressSpace() == default_space:
+                    entry_point = _addr_str(addr)
+                    break
+        except Exception:
+            pass
+
+    # ---- min/max address restricted to the default address space ---------
+    # Upstream's program.getMinAddress() / getMaxAddress() iterate every block
+    # including Ghidra's synthetic OTHER overlay (where it parks ELF metadata
+    # blocks like `_elfSectionHeaders`). We want the real loaded range.
+    default_min = None
+    default_max = None
+    for block in mem.getBlocks():
+        start = block.getStart()
+        if start.getAddressSpace() != default_space:
+            continue
+        end = block.getEnd()
+        if default_min is None or start.compareTo(default_min) < 0:
+            default_min = start
+        if default_max is None or end.compareTo(default_max) > 0:
+            default_max = end
+    min_address = _addr_str(default_min) if default_min else None
+    max_address = _addr_str(default_max) if default_max else None
 
     # ---- sections ----------------------------------------------------------
     sections = []
@@ -159,6 +205,9 @@ _RECON_SCRIPT = textwrap.dedent(
         "security": security,
         "top_symbols": top_symbols,
         "top_symbols_count": len(top_symbols),
+        "entry_point": entry_point,
+        "min_address": min_address,
+        "max_address": max_address,
     }
     _ = result
     '''
@@ -187,6 +236,13 @@ def curate(
         "read_only": upstream.get("read_only"),
     }
     out.update(recon)
+    # Recon's entry_point / min_address / max_address override upstream only
+    # when recon actually produced a value. Upstream returns null on stripped
+    # binaries (entry_point) and leaks Ghidra's OTHER overlay into max_address;
+    # recon corrects both, restricted to the default address space.
+    for k in ("entry_point", "min_address", "max_address"):
+        if recon.get(k) is None and upstream.get(k) is not None:
+            out[k] = upstream[k]
     return out
 
 

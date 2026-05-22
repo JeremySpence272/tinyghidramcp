@@ -47,7 +47,19 @@ def test_default_drops_data_references(server, stub_backend, tool):
     assert r["isError"] is False
     assert sc["count"] == 1
     assert sc["items"][0]["reference_type"] == "UNCONDITIONAL_CALL"
-    assert sc.get("filtered_out") == "data refs (include_data=false)"
+    assert sc["filtered_out"] == {"count": 2, "reason": "data refs (include_data=false)"}
+
+
+@pytest.mark.parametrize("tool", ["xrefs.to", "xrefs.from"])
+def test_no_filtered_out_marker_when_nothing_to_filter(server, stub_backend, tool):
+    """When the upstream returned only code refs (or zero refs), the
+    `filtered_out` marker is absent — otherwise the agent might wrongly
+    assume that include_data=true would surface more."""
+    _wire_xrefs(stub_backend, [CODE_REF])  # only a code ref; nothing to filter
+    r = _call(server, tool, {"address": "0x405000"})
+    sc = r["structuredContent"]
+    assert sc["count"] == 1
+    assert "filtered_out" not in sc
 
 
 @pytest.mark.parametrize("tool", ["xrefs.to", "xrefs.from"])
