@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyghidramcp"
+dynamic = ["version"]
+description = "A minimal Ghidra MCP server for AI agents. Twelve curated tools plus a pyghidra escape hatch."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+keywords = ["ghidra", "pyghidra", "mcp", "reverse-engineering", "ai-agent"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Intended Audience :: Developers",
+  "Topic :: Security",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "pyghidra>=3.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.15,<0.16",
+]
+
+[project.scripts]
+tinyghidramcp = "tinyghidramcp.cli:main"
+
+[tool.setuptools]
+packages = ["tinyghidramcp"]
+
+[tool.setuptools.dynamic]
+version = { attr = "tinyghidramcp._version.__version__" }
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+  "live: requires a real Ghidra install and pyghidra.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["tinyghidramcp", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "ARG", "PL", "RUF"]
+ignore = [
+  "E501",
+  "PLR0913",
+  "PLR0911",
+  "PLR0912",
+  "PLR2004",
+  "PLW0108",
+  "PLC0415",
+  "SIM105",
+  "SIM108",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
