@@ -1,7 +1,6 @@
 # tinyghidramcp
 
-A minimal Ghidra MCP server for AI agents. Twelve curated tools plus a `pyghidra.exec`
-escape hatch — designed from empirical agent-usage data, not from a feature checklist.
+A minimal Ghidra MCP server for AI agents. Twelve curated tools plus a `pyghidra.exec` escape hatch. Designed from empirical agent-usage data to provide agent stateful decompilation tools without excessive bloat.
 
 ## Status
 
