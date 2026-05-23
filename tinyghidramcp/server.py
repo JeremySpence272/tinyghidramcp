@@ -930,13 +930,63 @@ class SimpleMcpServer:
         self, method_name: str
     ) -> Callable[[dict[str, Any]], dict[str, Any]]:
         """Handler for xrefs.to / xrefs.from. Pops `include_data` (default False),
-        calls the upstream method, and filters the response."""
+        calls the upstream method, filters the response, and -- for xrefs.from
+        only -- auto-expands a function-entry `address` to the function body.
+
+        The auto-expansion fixes a real semantic mismatch: upstream's
+        `xref_from(address=X)` returns refs from that single instruction. Agents
+        pass a function entry expecting "what does this function call?", and
+        get count=0 because the entry instruction itself usually has no
+        outbound refs (the calls live deeper in the body).
+        """
         base_handler = self._make_backend_handler(method_name)
+        auto_expand = method_name == "xref_from"
 
         def handler(arguments: dict[str, Any]) -> dict[str, Any]:
             include_data = bool(arguments.pop("include_data", False))
+            expanded_from = None
+
+            if (
+                auto_expand
+                and self._auto_session_id is not None
+                and arguments.get("address")
+                and not arguments.get("start")
+                and not arguments.get("end")
+            ):
+                # Resolve via the address-tolerance helper. If it lands on a
+                # function (`exact` or `containing`), expand `address` to a
+                # body-wide start/end range so we see calls + reads + writes
+                # from anywhere inside the function.
+                from .address_tolerance import resolve as _resolve_address
+
+                try:
+                    hit = _resolve_address(
+                        self._backend, self._auto_session_id, arguments["address"]
+                    )
+                except Exception:
+                    hit = None
+                if hit and hit.get("kind") in ("exact", "containing"):
+                    body = self._lookup_function_body(hit["address"])
+                    if body is not None:
+                        expanded_from = arguments["address"]
+                        arguments = {**arguments,
+                                     "start": body[0], "end": body[1]}
+                        arguments.pop("address", None)
+
             result = base_handler(arguments)
-            if not isinstance(result, dict) or include_data:
+            if not isinstance(result, dict):
+                return result
+
+            if expanded_from is not None:
+                result = dict(result)
+                result["address_expanded"] = {
+                    "requested": expanded_from,
+                    "start": arguments["start"],
+                    "end": arguments["end"],
+                    "reason": "function_body",
+                }
+
+            if include_data:
                 return result
             items = result.get("items")
             if isinstance(items, list):
@@ -945,9 +995,6 @@ class SimpleMcpServer:
                 result = dict(result)
                 result["items"] = kept
                 result["count"] = len(kept)
-                # Only annotate if we actually filtered anything; an empty result
-                # plus a "filtered_out" marker would falsely suggest adding
-                # include_data would surface more.
                 if dropped > 0:
                     result["filtered_out"] = {
                         "count": dropped,
@@ -956,6 +1003,30 @@ class SimpleMcpServer:
             return result
 
         return handler
+
+    def _lookup_function_body(self, function_addr: str) -> tuple[str, str] | None:
+        """Return (body_min, body_max) for a function at the given entry address,
+        or None if not a function. Cheap one-shot eval_code call."""
+        snippet = (
+            f"_addr = {function_addr!r}\n"
+            "_fn = program.getFunctionManager().getFunctionAt("
+            "program.getAddressFactory().getDefaultAddressSpace().getAddress("
+            "int(_addr, 16) if isinstance(_addr, str) else _addr))\n"
+            "if _fn is not None:\n"
+            "    _body = _fn.getBody()\n"
+            "    _ = ('0x%x' % _body.getMinAddress().getOffset(),\n"
+            "         '0x%x' % _body.getMaxAddress().getOffset())\n"
+            "else:\n"
+            "    _ = None\n"
+        )
+        try:
+            raw = self._backend.eval_code(snippet, session_id=self._auto_session_id)
+        except Exception:
+            return None
+        out = raw.get("result") if isinstance(raw, dict) else raw
+        if isinstance(out, (list, tuple)) and len(out) == 2:
+            return (str(out[0]), str(out[1]))
+        return None
 
     def _make_backend_handler(self, method_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
         # Resolve the backend method per-call rather than capturing at handler-

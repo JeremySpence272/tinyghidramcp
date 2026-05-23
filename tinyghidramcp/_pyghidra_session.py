@@ -28,6 +28,11 @@ _BACKEND_KEYS: set[str] = {
     # Our injected aliases (also refreshed each call).
     "currentProgram", "currentAddress", "monitor", "flatAPI", "decompAPI",
     "fm", "sm", "mem", "cache",
+    # Per-call output slots. `result` and `_` are the script's output for THIS
+    # call; persisting them would let a previous call's `result` clobber the
+    # next call's expression value via the postlude's `if 'result' in globals():
+    # _ = result` rule.
+    "result", "_",
 }
 
 # Sticky address (lives in STATE but is exposed as `currentAddress`).

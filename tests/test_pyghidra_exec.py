@@ -126,6 +126,22 @@ def test_globals_persist_across_calls(eval_server):
     assert r["structuredContent"]["result"] == 43
 
 
+def test_result_does_not_persist_across_calls(eval_server):
+    """Regression: a previous call's `result = ...` must NOT clobber the
+    next call's expression value. The postlude's `if 'result' in globals():
+    _ = result` rule would otherwise use the stale value injected from STATE.
+    Excluding `result` and `_` from persistence is the fix."""
+    # Script call sets `result` explicitly.
+    r1 = _call(eval_server, "result = 'from-call-1'")
+    assert r1["structuredContent"]["result"] == "from-call-1"
+
+    # Pure-expression call. With the bug, this would still return
+    # 'from-call-1' because the postlude re-runs `_ = result`. With the
+    # fix, `result` is not in STATE, so the expression's value wins.
+    r2 = _call(eval_server, "currentProgram.getName()")
+    assert r2["structuredContent"]["result"] == "binary"
+
+
 def test_script_result_variable_is_returned(eval_server):
     r = _call(eval_server, "x = 5\ny = 7\nresult = x * y")
     assert r["structuredContent"]["result"] == 35
