@@ -93,9 +93,33 @@ def _git_sha_at_runtime() -> str | None:
     return None
 
 
+def _install_faulthandler() -> None:
+    """Dump all Python thread stacks to stderr on SIGUSR1.
+
+    Lets a SRE / agent runner kick the server with `kill -USR1 <pid>` and get
+    a full thread dump without installing py-spy or any other tooling. Also
+    enables the standard faulthandler for fatal-signal dumps (SIGSEGV etc.).
+    Best-effort: silently skipped on platforms without SIGUSR1 (Windows).
+    """
+    import faulthandler
+    import sys
+
+    faulthandler.enable(file=sys.stderr)
+    try:
+        import signal
+
+        sig = getattr(signal, "SIGUSR1", None)
+        if sig is not None:
+            faulthandler.register(sig, file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     parser.parse_args(argv)
+
+    _install_faulthandler()
 
     telemetry = telemetry_from_env()
     backend = build_backend()

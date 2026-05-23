@@ -244,11 +244,19 @@ DOCS: dict[str, dict[str, Any]] = {
             "(sticky), `monitor`, `flatAPI`, `decompAPI`, `listing`, `fm`, `sm`, "
             "`mem`, `cache` (with `cache.invalidate()` to flush decompile cache). "
             "Auto-detects single-line expression vs multi-line script: an expression "
-            "returns its value as `result`; a script can set `result` explicitly."
+            "returns its value as `result`; a script can set `result` explicitly.\n\n"
+            "**Budget your loops.** This tool enforces a wall-clock timeout (default "
+            "60 s, max 600 s via `timeout_sec`). Scripts that exceed the budget are "
+            "aborted and the persistent globals are rolled back to their pre-call "
+            "state. The Ghidra worker thread itself may continue running in the JVM "
+            "until the call completes naturally -- we can't safely interrupt mid-call. "
+            "For brute-force scans, fuzzing, or anything you'd `for i in range(10**6)` "
+            "over: write the script to a file via the `Write` tool and run it via "
+            "bash. Use `pyghidra.exec` for analytical queries, not for compute."
         ),
         "parameters": [
             {"name": "code", "type": "string", "description": "Python source code", "required": True},
-            {"name": "timeout_sec", "type": "integer", "description": "Wall-clock timeout (default 60)", "required": False},
+            {"name": "timeout_sec", "type": "number", "description": "Wall-clock timeout in seconds (default 60, max 600)", "required": False},
         ],
         "examples": [
             {
@@ -258,6 +266,10 @@ DOCS: dict[str, dict[str, Any]] = {
             {
                 "args": {"code": "result = [f.getName() for f in fm.getFunctions(True) if 'aes' in f.getName().lower()]"},
                 "result_summary": "script returns list of AES-related function names",
+            },
+            {
+                "args": {"code": "import time; time.sleep(120)", "timeout_sec": 5},
+                "result_summary": "error_code=timeout; globals rolled back",
             },
         ],
         "pyghidra_alternative": "(this IS the pyghidra escape hatch)",

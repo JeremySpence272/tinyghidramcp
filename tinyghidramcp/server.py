@@ -188,7 +188,11 @@ _BASE_DESCRIPTIONS: dict[str, str] = {
         "Run arbitrary Python with currentProgram, currentAddress, monitor, flatAPI, "
         "decompAPI, listing, fm, sm, mem, and cache bound. Globals persist between calls. "
         "No sandbox. This runs as root in the agent's container with full filesystem and "
-        "Ghidra API access."
+        "Ghidra API access. **WALL-CLOCK TIMEOUT: default 60s, max 600s via `timeout_sec`. "
+        "Scripts that exceed the budget are aborted and globals are rolled back to the "
+        "pre-call state.** Use this tool for analytical queries (introspect the program, "
+        "compute summaries, dump bytes); for brute-force loops or long-running scans, "
+        "write the script to disk and run it via bash instead -- not through this tool."
     ),
 }
 
@@ -334,6 +338,9 @@ def _augment_spec(spec: dict[str, Any]) -> dict[str, Any]:
         # Custom handler accepts include_data on top of the upstream signature.
         # Default false: only code references are returned.
         spec["properties"]["include_data"] = {"type": "boolean"}
+    elif spec["name"] == "pyghidra.exec":
+        # Custom handler enforces a wall-clock timeout. Default 60s, max 600s.
+        spec["properties"]["timeout_sec"] = {"type": "number"}
     return spec
 
 
@@ -375,6 +382,8 @@ class SimpleMcpServer:
     BINARY_PATH = "/workspace/challenge/binary"
 
     def __init__(self, backend: Any, telemetry: Any = None):
+        import concurrent.futures
+
         from .decompile_cache import DecompileCache
         from .telemetry import Telemetry, from_env
 
@@ -394,6 +403,15 @@ class SimpleMcpServer:
         self._decompile_cache = DecompileCache()
         # Cached binary.summary response for the session; computed once on first call.
         self._binary_summary_cache: dict[str, Any] | None = None
+        # Long-lived single-thread executor for pyghidra.exec. Never shut down
+        # explicitly: on timeout we abandon the future and let the worker
+        # thread keep running in the JVM until it completes naturally (next
+        # call queues behind it). Using a context manager here would block the
+        # response until the worker finishes -- defeating the whole point of
+        # a wall-clock cap.
+        self._pyghidra_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tgm-pyghidra"
+        )
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "meta.help": self._tool_meta_help,
             "decompile.batch": self._tool_decompile_batch,
@@ -1172,9 +1190,20 @@ class SimpleMcpServer:
         "_tgm_globals_size = _tgm_sess.persist(globals())\n"
     )
 
+    PYGHIDRA_EXEC_DEFAULT_TIMEOUT_SEC = 60
+    PYGHIDRA_EXEC_MAX_TIMEOUT_SEC = 600
+
     def _tool_pyghidra_exec(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Execute arbitrary Python with persistent globals and bound aliases."""
+        """Execute arbitrary Python with persistent globals and bound aliases.
+
+        Hard wall-clock timeout: default 60s, max 600s. On timeout we roll
+        STATE back to the pre-call snapshot and return error_code="timeout".
+        The Ghidra-side Python worker may continue running in the JVM (we
+        can't safely interrupt mid-call), but as far as the agent's session
+        state is concerned the call had no effect.
+        """
         import ast
+        import concurrent.futures
         import time
 
         from . import _pyghidra_session
@@ -1187,6 +1216,18 @@ class SimpleMcpServer:
                 field="code",
                 expected="string",
             )
+        timeout_sec = arguments.get("timeout_sec", self.PYGHIDRA_EXEC_DEFAULT_TIMEOUT_SEC)
+        if not isinstance(timeout_sec, (int, float)) or timeout_sec <= 0:
+            raise ToolError(
+                "timeout_sec must be a positive number",
+                error_code="bad_args",
+                field="timeout_sec",
+                expected="positive number (seconds)",
+            )
+        # Cap at the max -- agents that need longer should write the script to
+        # disk and shell out via bash; pyghidra.exec is for interactive work.
+        timeout_sec = min(float(timeout_sec), float(self.PYGHIDRA_EXEC_MAX_TIMEOUT_SEC))
+
         # Auto-detect expression vs script. If the whole agent block parses as
         # a single expression, capture its value as `_` for the upstream eval
         # path. Otherwise run as a script; agents can set `result = ...`.
@@ -1196,16 +1237,41 @@ class SimpleMcpServer:
         except SyntaxError:
             agent_block = code
         wrapped = self._PYGHIDRA_PRELUDE + agent_block + self._PYGHIDRA_POSTLUDE
+
+        # Snapshot session state so a timed-out script rolls back to last-good.
+        snap = _pyghidra_session.snapshot()
         t0 = time.monotonic()
+        fut = self._pyghidra_executor.submit(
+            self._backend.eval_code, wrapped, session_id=self._auto_session_id
+        )
         try:
-            raw = self._backend.eval_code(wrapped, session_id=self._auto_session_id)
+            raw = fut.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            # Abandon the future; the worker thread keeps running in the JVM
+            # but our response returns NOW. Subsequent pyghidra.exec calls
+            # queue behind the abandoned worker (single-thread executor) --
+            # acceptable, the alternative (forcibly interrupting a thread
+            # holding Java locks) is unsafe.
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            _pyghidra_session.restore(snap)
+            raise ToolError(
+                f"pyghidra.exec exceeded {timeout_sec:.0f}s wall-clock budget; "
+                "globals rolled back to pre-call state",
+                error_code="timeout",
+                next_action=(
+                    "the worker thread is still running in the JVM and will not be "
+                    "interrupted; the next pyghidra.exec call will queue behind it. "
+                    "For brute-force or long-running work, write the script to disk "
+                    "and run it via bash instead. For deeper budgets on a single "
+                    "analytical query, pass `timeout_sec` (max 600)."
+                ),
+                field="code",
+                duration_ms=duration_ms,
+            ) from None
         except GhidraBackendError as exc:
             raise ToolError(str(exc), error_code="internal") from exc
         duration_ms = int((time.monotonic() - t0) * 1000)
 
-        # Pull globals_size_bytes out of the eval context if the postlude wrote it.
-        # (The upstream doesn't surface arbitrary variables, but it does include
-        # stdout/stderr. We instead rely on _pyghidra_session.STATE size after persist.)
         globals_size_bytes = _pyghidra_session._approx_size(_pyghidra_session.STATE)
 
         result_payload = raw.get("result") if isinstance(raw, dict) else raw

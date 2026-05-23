@@ -23,6 +23,10 @@ ERROR_CODES: frozenset[str] = frozenset(
         "unsupported",
         "transient",
         "internal",
+        # Wall-clock timeout (currently emitted by pyghidra.exec when a script
+        # blows past its budget). Globals are rolled back to the pre-call
+        # snapshot; the agent should treat the call as having never happened.
+        "timeout",
     ]
 )
 

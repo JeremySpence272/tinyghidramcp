@@ -117,3 +117,22 @@ def reset() -> None:
     STATE.clear()
     global INVALIDATE_REQUESTED
     INVALIDATE_REQUESTED = False
+
+
+def snapshot() -> dict[str, Any]:
+    """Capture pre-call STATE + invalidate flag so a timed-out / failed script
+    can be rolled back to last-known-good. Shallow dict copy: the *keys* are
+    snapshotted, and Python objects held by STATE are referenced by identity
+    (deep-copying live Ghidra Java handles isn't safe)."""
+    return {
+        "state": dict(STATE),  # shallow copy of the dict itself
+        "invalidate": INVALIDATE_REQUESTED,
+    }
+
+
+def restore(snap: dict[str, Any]) -> None:
+    """Roll back STATE and the invalidate flag to a previous snapshot."""
+    global INVALIDATE_REQUESTED
+    STATE.clear()
+    STATE.update(snap.get("state", {}))
+    INVALIDATE_REQUESTED = bool(snap.get("invalidate", False))
