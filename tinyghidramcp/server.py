@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, BinaryIO
@@ -39,9 +40,12 @@ _CODE_REF_TYPES: frozenset[str] = frozenset({
     "TERMINATOR",
     "CALL_OVERRIDE_UNCONDITIONAL",
     "JUMP_OVERRIDE_UNCONDITIONAL",
-    "INDIRECTION",
-    "INVALID",
     "CALLOTHER_RETURN",
+    # NOTE: INDIRECTION is a *data-pointer* reference (Ghidra's `INDIRECTION`
+    # ref_type marks reads/writes through a computed pointer); it is not
+    # control flow and must be filtered out when include_data=false.
+    # INVALID is by definition not a valid ref of any kind. Both belong in
+    # the data bucket -- the comment above already said as much.
 })
 
 
@@ -431,6 +435,13 @@ class SimpleMcpServer:
                 self._tool_handlers[spec["name"]] = self._make_xrefs_handler(
                     spec["backend_method"]
                 )
+            elif spec["name"] == "search.functions":
+                # Custom wrapper: actual regex (default), with `exact=true`
+                # falling through to the upstream literal-match path. The
+                # upstream's non-exact behaviour is substring, not regex,
+                # despite our docs promising regex -- so this handler is
+                # what makes the contract real.
+                self._tool_handlers[spec["name"]] = self._tool_search_functions
             else:
                 self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
 
@@ -1143,6 +1154,99 @@ class SimpleMcpServer:
         out = dict(curated)
         out["cached"] = False
         return out
+
+    # ---------- search.functions ------------------------------------------
+
+    _SEARCH_FUNCTIONS_REGEX_SCRIPT = textwrap.dedent("""
+        import re
+        try:
+            _pat = re.compile(_pattern)
+        except re.error as _exc:
+            _ = {"_regex_error": str(_exc)}
+        else:
+            fm = program.getFunctionManager()
+            _matches = []
+            _total = 0
+            for _fn in fm.getFunctions(True):
+                _name = str(_fn.getName())
+                if _pat.search(_name):
+                    _total += 1
+                    if len(_matches) < _limit:
+                        _entry = _fn.getEntryPoint()
+                        _body  = _fn.getBody()
+                        _matches.append({
+                            "name": _name,
+                            "entry_point": "0x%x" % _entry.getOffset(),
+                            "body_start": "0x%x" % _body.getMinAddress().getOffset(),
+                            "body_end":   "0x%x" % _body.getMaxAddress().getOffset(),
+                            "signature": str(_fn.getPrototypeString(False, True)),
+                            "calling_convention": str(_fn.getCallingConventionName()),
+                            "external": bool(_fn.isExternal()),
+                            "thunk":    bool(_fn.isThunk()),
+                        })
+            _ = {
+                "query": _pattern, "exact": False, "regex": True,
+                "limit": _limit, "total": _total, "count": len(_matches),
+                "items": _matches,
+            }
+    """).strip()
+
+    def _tool_search_functions(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Regex search over function names. Default mode is real Python regex
+        (via ``re.search``). ``exact=true`` falls through to the upstream
+        literal-equality path. ``limit`` bounds the *returned* matches; total
+        match count is reported separately."""
+        name = arguments.get("name")
+        if not isinstance(name, str) or not name:
+            raise ToolError(
+                "search.functions requires a non-empty `name` argument",
+                error_code="bad_args",
+                field="name",
+                expected="string (regex pattern, or literal if exact=true)",
+            )
+        limit = arguments.get("limit", 50)
+        if not isinstance(limit, int) or limit <= 0:
+            raise ToolError(
+                "limit must be a positive integer",
+                error_code="bad_args",
+                field="limit",
+                expected="positive integer",
+            )
+        exact = bool(arguments.get("exact", False))
+
+        if exact:
+            # Upstream's exact path is literal equality on full function name.
+            return self._backend.function_by_name(
+                self._auto_session_id, name, exact=True, limit=limit
+            )
+
+        # Regex path: run inside the JVM via eval_code, return the same
+        # shape upstream returns plus a `regex: true` flag.
+        snippet = (
+            f"_pattern = {name!r}\n"
+            f"_limit = {limit}\n"
+            f"{self._SEARCH_FUNCTIONS_REGEX_SCRIPT}"
+        )
+        try:
+            raw = self._backend.eval_code(snippet, session_id=self._auto_session_id)
+        except GhidraBackendError as exc:
+            raise ToolError(str(exc), error_code="internal") from exc
+        payload = raw.get("result") if isinstance(raw, dict) else raw
+        if not isinstance(payload, dict):
+            raise ToolError(
+                f"search.functions regex pipeline returned unexpected shape: {payload!r}",
+                error_code="internal",
+            )
+        # Bad regex from the agent: convert the inline error into a structured
+        # bad_args response.
+        if "_regex_error" in payload:
+            raise ToolError(
+                f"invalid regex: {payload['_regex_error']}",
+                error_code="bad_args",
+                field="name",
+                expected="valid Python regular expression",
+            )
+        return payload
 
     # ---------- decompile + decompile.batch -------------------------------
 

@@ -50,6 +50,29 @@ def test_default_drops_data_references(server, stub_backend, tool):
     assert sc["filtered_out"] == {"count": 2, "reason": "data refs (include_data=false)"}
 
 
+INDIRECTION_REF = {
+    "from": "0x401234", "to": "0x405000", "reference_type": "INDIRECTION",
+    "operand_index": 1, "primary": True, "external": False,
+}
+INVALID_REF = {
+    "from": "0x401234", "to": "0x405000", "reference_type": "INVALID",
+    "operand_index": 0, "primary": True, "external": False,
+}
+
+
+@pytest.mark.parametrize("tool", ["xrefs.to", "xrefs.from"])
+def test_indirection_and_invalid_are_treated_as_data(server, stub_backend, tool):
+    """INDIRECTION is a data-pointer ref and INVALID is by definition not a
+    valid code-flow ref. Both must be dropped when include_data=false even
+    though they're not the obvious READ/WRITE/DATA cases."""
+    _wire_xrefs(stub_backend, [CODE_REF, INDIRECTION_REF, INVALID_REF])
+    r = _call(server, tool, {"address": "0x405000"})
+    sc = r["structuredContent"]
+    assert sc["count"] == 1
+    assert sc["items"][0]["reference_type"] == "UNCONDITIONAL_CALL"
+    assert sc["filtered_out"]["count"] == 2
+
+
 @pytest.mark.parametrize("tool", ["xrefs.to", "xrefs.from"])
 def test_no_filtered_out_marker_when_nothing_to_filter(server, stub_backend, tool):
     """When the upstream returned only code refs (or zero refs), the
