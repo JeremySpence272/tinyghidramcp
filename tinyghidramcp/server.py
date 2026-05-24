@@ -409,13 +409,15 @@ class SimpleMcpServer:
         self._binary_summary_cache: dict[str, Any] | None = None
         # Long-lived single-thread executor for pyghidra.exec. Never shut down
         # explicitly: on timeout we abandon the future and let the worker
-        # thread keep running in the JVM until it completes naturally (next
-        # call queues behind it). Using a context manager here would block the
-        # response until the worker finishes -- defeating the whole point of
-        # a wall-clock cap.
+        # thread keep running in the JVM until it completes naturally. The
+        # next call detects the abandoned worker via `_pending_pyghidra_future`
+        # and fast-fails instead of queueing behind it (which would block
+        # the agent for a full second timeout cycle even though we know
+        # nothing useful will happen).
         self._pyghidra_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="tgm-pyghidra"
         )
+        self._pending_pyghidra_future: concurrent.futures.Future | None = None
         self._tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "meta.help": self._tool_meta_help,
             "decompile.batch": self._tool_decompile_batch,
@@ -442,6 +444,10 @@ class SimpleMcpServer:
                 # despite our docs promising regex -- so this handler is
                 # what makes the contract real.
                 self._tool_handlers[spec["name"]] = self._tool_search_functions
+            elif spec["name"] == "search.strings":
+                # Same story as search.functions: upstream does substring;
+                # docs (and the example `^GNU`) promise regex.
+                self._tool_handlers[spec["name"]] = self._tool_search_strings
             else:
                 self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
 
@@ -997,6 +1003,22 @@ class SimpleMcpServer:
                     "reason": "function_body",
                 }
 
+            # Truncation marker: when count == limit, the agent has no way to
+            # know whether there's more (upstream doesn't return a `total`).
+            # Flag it explicitly so the agent doesn't misread the count as
+            # exhaustive. NOTE: this fires BEFORE include_data filtering so the
+            # marker reflects upstream's truncation, not ours.
+            raw_count = result.get("count")
+            requested_limit = arguments.get("limit", 100)
+            if isinstance(raw_count, int) and isinstance(requested_limit, int) \
+                    and raw_count >= requested_limit:
+                result = dict(result)
+                result["truncated"] = True
+                result["truncation_hint"] = (
+                    f"count == limit ({requested_limit}); there may be more "
+                    "references. Raise `limit` or use start/end range."
+                )
+
             if include_data:
                 return result
             items = result.get("items")
@@ -1036,7 +1058,13 @@ class SimpleMcpServer:
             return None
         out = raw.get("result") if isinstance(raw, dict) else raw
         if isinstance(out, (list, tuple)) and len(out) == 2:
-            return (str(out[0]), str(out[1]))
+            body_min, body_max = str(out[0]), str(out[1])
+            # Degenerate single-address bodies (PLT thunks, tail-call stubs)
+            # would produce an empty start-only range; skip expansion and let
+            # the original `address` flow through unchanged.
+            if body_min == body_max:
+                return None
+            return (body_min, body_max)
         return None
 
     def _make_backend_handler(self, method_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -1047,14 +1075,14 @@ class SimpleMcpServer:
         class_signature = inspect.signature(getattr(GhidraBackend, method_name))
         accepts_session_id = "session_id" in class_signature.parameters
         # Address-tolerance is only useful where the call requires a function
-        # entry (decompile, disassemble). xrefs.to / xrefs.from accept any
-        # address (including data labels), so tolerance there would wrongly
-        # reject legitimate string/data targets.
-        _TOLERANT_METHODS = {"decomp_function", "disasm_function"}
+        # entry (decompile, disassemble, callgraph endpoints). xrefs.to /
+        # xrefs.from accept any address (including data labels), so tolerance
+        # there would wrongly reject legitimate string/data targets.
+        _TOLERANT_METHODS = {"decomp_function", "disasm_function", "callgraph_paths"}
         if method_name in _TOLERANT_METHODS:
             tolerant_params = [
                 p for p in class_signature.parameters
-                if p in ("address", "function_start")
+                if p in ("address", "function_start", "source_function", "target_function")
             ]
         else:
             tolerant_params = []
@@ -1248,6 +1276,117 @@ class SimpleMcpServer:
             )
         return payload
 
+    # ---------- search.strings --------------------------------------------
+
+    _SEARCH_STRINGS_REGEX_SCRIPT = textwrap.dedent("""
+        # Iterate via the same machinery as upstream's binary_strings so the
+        # population matches: DefinedDataIterator.byDataInstance filtered to
+        # StringDataInstance entries, and getStringValue() for the content.
+        from ghidra.program.util import DefinedDataIterator
+        from ghidra.program.model.data import StringDataInstance
+        import re
+        try:
+            _pat = re.compile(_pattern)
+        except re.error as _exc:
+            _ = {"_regex_error": str(_exc)}
+        else:
+            _matches = []
+            _total = 0
+            _skipped = 0
+            _it = DefinedDataIterator.byDataInstance(
+                program,
+                lambda d: StringDataInstance.getStringDataInstance(d)
+                          != StringDataInstance.NULL_INSTANCE
+            )
+            for _data in _it:
+                _inst = StringDataInstance.getStringDataInstance(_data)
+                try:
+                    _val = str(_inst.getStringValue())
+                except Exception:
+                    continue
+                if not _pat.search(_val):
+                    continue
+                if _skipped < _offset:
+                    _skipped += 1
+                    continue
+                _total += 1
+                if len(_matches) < _limit:
+                    _matches.append({
+                        "address": "0x%x" % _data.getAddress().getOffset(),
+                        "value": _val,
+                        "length": int(_data.getLength()),
+                    })
+            _ = {
+                "query": _pattern, "regex": True,
+                "offset": _offset, "limit": _limit,
+                "total": _total + _skipped,
+                "count": len(_matches),
+                "items": _matches,
+            }
+    """).strip()
+
+    def _tool_search_strings(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Regex search over defined strings. Mirrors search.functions: regex
+        by default, `exact=true` falls through to the upstream substring path
+        (upstream has no equality mode for strings; exact=true behaves the
+        same as the legacy substring search). Invalid regex -> bad_args."""
+        query = arguments.get("query")
+        limit = arguments.get("limit", 100)
+        offset = arguments.get("offset", 0)
+        if not isinstance(limit, int) or limit <= 0:
+            raise ToolError(
+                "limit must be a positive integer",
+                error_code="bad_args",
+                field="limit",
+                expected="positive integer",
+            )
+        if not isinstance(offset, int) or offset < 0:
+            raise ToolError(
+                "offset must be a non-negative integer",
+                error_code="bad_args",
+                field="offset",
+                expected="non-negative integer",
+            )
+
+        # No query at all -> fall through to upstream which returns the full
+        # paginated list.
+        if not query:
+            return self._backend.binary_strings(
+                self._auto_session_id, offset=offset, limit=limit, query=None
+            )
+
+        if bool(arguments.get("exact", False)):
+            # Upstream's substring path; agents who set exact=true are opting
+            # out of regex and into "literal substring".
+            return self._backend.binary_strings(
+                self._auto_session_id, offset=offset, limit=limit, query=query
+            )
+
+        snippet = (
+            f"_pattern = {query!r}\n"
+            f"_limit = {limit}\n"
+            f"_offset = {offset}\n"
+            f"{self._SEARCH_STRINGS_REGEX_SCRIPT}"
+        )
+        try:
+            raw = self._backend.eval_code(snippet, session_id=self._auto_session_id)
+        except GhidraBackendError as exc:
+            raise ToolError(str(exc), error_code="internal") from exc
+        payload = raw.get("result") if isinstance(raw, dict) else raw
+        if not isinstance(payload, dict):
+            raise ToolError(
+                f"search.strings regex pipeline returned unexpected shape: {payload!r}",
+                error_code="internal",
+            )
+        if "_regex_error" in payload:
+            raise ToolError(
+                f"invalid regex: {payload['_regex_error']}",
+                error_code="bad_args",
+                field="query",
+                expected="valid Python regular expression",
+            )
+        return payload
+
     # ---------- decompile + decompile.batch -------------------------------
 
     def _tool_decompile(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1413,20 +1552,38 @@ class SimpleMcpServer:
             agent_block = code
         wrapped = self._PYGHIDRA_PRELUDE + agent_block + self._PYGHIDRA_POSTLUDE
 
+        # If a previous call timed out and its worker thread is still busy in
+        # the JVM, fast-fail this call instead of queueing behind it (which
+        # would block the agent for a full timeout cycle with nothing useful
+        # to show for it).
+        prev = self._pending_pyghidra_future
+        if prev is not None and not prev.done():
+            raise ToolError(
+                "a previous pyghidra.exec call timed out and its worker thread "
+                "is still running in the JVM",
+                error_code="state",
+                next_action=(
+                    "the abandoned worker is holding the single pyghidra.exec "
+                    "thread; this call cannot proceed until it finishes. Wait "
+                    "and retry, or use the curated tools (decompile, "
+                    "search.functions, xrefs.*) which do not share this thread."
+                ),
+                field="code",
+            )
+
         # Snapshot session state so a timed-out script rolls back to last-good.
         snap = _pyghidra_session.snapshot()
         t0 = time.monotonic()
         fut = self._pyghidra_executor.submit(
             self._backend.eval_code, wrapped, session_id=self._auto_session_id
         )
+        self._pending_pyghidra_future = fut
         try:
             raw = fut.result(timeout=timeout_sec)
         except concurrent.futures.TimeoutError:
             # Abandon the future; the worker thread keeps running in the JVM
-            # but our response returns NOW. Subsequent pyghidra.exec calls
-            # queue behind the abandoned worker (single-thread executor) --
-            # acceptable, the alternative (forcibly interrupting a thread
-            # holding Java locks) is unsafe.
+            # but our response returns NOW. The next call checks `done()`
+            # at the top and fast-fails if the worker is still busy.
             duration_ms = int((time.monotonic() - t0) * 1000)
             _pyghidra_session.restore(snap)
             raise ToolError(
@@ -1434,17 +1591,46 @@ class SimpleMcpServer:
                 "globals rolled back to pre-call state",
                 error_code="timeout",
                 next_action=(
-                    "the worker thread is still running in the JVM and will not be "
-                    "interrupted; the next pyghidra.exec call will queue behind it. "
-                    "For brute-force or long-running work, write the script to disk "
-                    "and run it via bash instead. For deeper budgets on a single "
+                    "the worker thread is still running in the JVM and will not "
+                    "be interrupted. Subsequent pyghidra.exec calls will fail "
+                    "fast with error_code=state until the worker completes. "
+                    "For brute-force / long-running work, write the script to "
+                    "disk and run via bash. For deeper budgets on a single "
                     "analytical query, pass `timeout_sec` (max 600)."
                 ),
                 field="code",
                 duration_ms=duration_ms,
             ) from None
         except GhidraBackendError as exc:
+            self._pending_pyghidra_future = None
             raise ToolError(str(exc), error_code="internal") from exc
+        except SystemExit as exc:
+            # The agent script called sys.exit(); upstream's eval_code propagates
+            # SystemExit (a BaseException), which without this catch would kill
+            # the server process entirely -- restart with no preceding error
+            # record because telemetry isn't flushed before process death.
+            self._pending_pyghidra_future = None
+            _pyghidra_session.restore(snap)
+            raise ToolError(
+                f"pyghidra.exec script called sys.exit({exc.code!r}); SystemExit "
+                "is intercepted to prevent the server from dying. Globals rolled "
+                "back to pre-call state.",
+                error_code="unsupported",
+                next_action=(
+                    "don't call sys.exit() inside pyghidra.exec; just let the "
+                    "script reach its end, or set `result = ...` to return a value."
+                ),
+                field="code",
+            ) from None
+        except KeyboardInterrupt:
+            self._pending_pyghidra_future = None
+            _pyghidra_session.restore(snap)
+            raise ToolError(
+                "pyghidra.exec was interrupted",
+                error_code="transient",
+                field="code",
+            ) from None
+        self._pending_pyghidra_future = None
         duration_ms = int((time.monotonic() - t0) * 1000)
 
         globals_size_bytes = _pyghidra_session._approx_size(_pyghidra_session.STATE)

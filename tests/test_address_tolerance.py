@@ -75,6 +75,21 @@ def test_miss_unanalyzed_code_returns_structured_error(server, stub_backend):
     assert "createFunction" in sc["pyghidra_hint"]
 
 
+def test_address_overflow_returns_bad_args(server, stub_backend):
+    """F1: addresses beyond Java's signed-long range get a clear bad_args
+    response instead of crashing the JVM with OverflowError."""
+    stub_backend.next_eval_response = {
+        "kind": "miss", "reason": "address_overflow",
+        "is_code": False, "in_section": None, "requested": "0xffffffffffffffff",
+    }
+    r = _call_decompile(server, "0xffffffffffffffff")
+    sc = r["structuredContent"]
+    assert r["isError"] is True
+    assert sc["error_code"] == "bad_args"
+    assert sc["field"] == "address"
+    assert "63-bit" in sc["error"] or "64-bit" in sc["error"]
+
+
 def test_miss_data_returns_structured_error(server, stub_backend):
     stub_backend.next_eval_response = {
         "kind": "miss", "is_code": False, "in_section": ".rodata", "reason": "data",

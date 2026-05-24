@@ -113,8 +113,25 @@ _RESOLVE_SCRIPT = textwrap.dedent(
             addr_int = ranked[0][1]
             _name_lookup_used = True
 
+    if addr_int is not None and addr_int > 0x7fffffffffffffff:
+        # Java's long maxes out at 2^63-1; Ghidra's AddressFactory.getAddress
+        # raises OverflowError beyond that. Reject as bad_args before the JNI
+        # boundary so the agent gets a clear message instead of an opaque crash.
+        result = {"kind": "miss", "reason": "address_overflow",
+                  "is_code": False, "in_section": None,
+                  "requested": str(_addr)}
+        addr_int = None
+
     if addr_int is not None:
-        addr_obj = program.getAddressFactory().getDefaultAddressSpace().getAddress(addr_int)
+        try:
+            addr_obj = program.getAddressFactory().getDefaultAddressSpace().getAddress(addr_int)
+        except OverflowError:
+            result = {"kind": "miss", "reason": "address_overflow",
+                      "is_code": False, "in_section": None,
+                      "requested": str(_addr)}
+            addr_int = None
+
+    if addr_int is not None:
         fm = program.getFunctionManager()
         mem = program.getMemory()
 
@@ -310,6 +327,22 @@ def resolve(backend: Any, session_id: str, address: Any) -> dict[str, Any]:
         is_code = bool(result.get("is_code"))
         reason = result.get("reason", "not_found")
         message = f"no function found for {address!r}"
+
+        if reason == "address_overflow":
+            raise ToolError(
+                f"address {address!r} exceeds the 64-bit signed range and cannot "
+                "be a valid virtual address",
+                error_code="bad_args",
+                next_action=(
+                    "check `binary.summary` for the program's image base and "
+                    "address range; valid addresses fit in a 63-bit unsigned int."
+                ),
+                pyghidra_hint=(
+                    "currentProgram.getMinAddress(), currentProgram.getMaxAddress()"
+                ),
+                field="address",
+                requested=str(address),
+            )
 
         if reason == "name_not_found":
             raise ToolError(

@@ -47,8 +47,11 @@ DOCS: dict[str, dict[str, Any]] = {
     },
     "search.functions": {
         "description": (
-            "Search functions by name. Default is regex; set exact=true for literal "
-            "string match. Returns name, entry address, and signature for each hit."
+            "Search functions by name. Default is regex (Python `re.search`); set "
+            "`exact=true` for literal string match. Regex mode is **case-sensitive**; "
+            "the upstream substring fallback (via `exact=true`) is case-INsensitive. "
+            "Returns name, entry address, signature, and a `regex: true` flag on the "
+            "default path."
         ),
         "parameters": [
             {"name": "name", "type": "string", "description": "Regex pattern (or literal if exact=true)", "required": True},
@@ -250,9 +253,20 @@ DOCS: dict[str, dict[str, Any]] = {
             "aborted and the persistent globals are rolled back to their pre-call "
             "state. The Ghidra worker thread itself may continue running in the JVM "
             "until the call completes naturally -- we can't safely interrupt mid-call. "
-            "For brute-force scans, fuzzing, or anything you'd `for i in range(10**6)` "
-            "over: write the script to a file via the `Write` tool and run it via "
-            "bash. Use `pyghidra.exec` for analytical queries, not for compute."
+            "Subsequent pyghidra.exec calls will fast-fail with error_code=state "
+            "until the worker completes. For brute-force scans, fuzzing, or anything "
+            "you'd `for i in range(10**6)` over: write the script to a file via the "
+            "`Write` tool and run it via bash. Use `pyghidra.exec` for analytical "
+            "queries, not for compute.\n\n"
+            "**Rollback is shallow.** The snapshot captures STATE's *keys* and "
+            "references its values by identity. If a timed-out script mutated a "
+            "mutable global IN PLACE (e.g. `x.append(4)` on a pre-existing list), "
+            "that mutation survives the rollback -- only key-level adds/removes/"
+            "reassignments are reverted. To be safe across timeout boundaries, "
+            "rebind variables (`x = x + [4]`) rather than mutating them in place.\n\n"
+            "**`sys.exit()` is intercepted.** Calling `sys.exit()` from inside "
+            "pyghidra.exec is converted to error_code=unsupported instead of "
+            "killing the server. Don't rely on it as a flow-control mechanism."
         ),
         "parameters": [
             {"name": "code", "type": "string", "description": "Python source code", "required": True},
