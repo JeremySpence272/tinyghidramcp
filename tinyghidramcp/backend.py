@@ -672,6 +672,10 @@ class GhidraBackend:
             end_addr = start_addr.add(int(length) - 1)
         else:
             end_addr = start_addr
+        if start_addr.compareTo(end_addr) > 0:
+            raise GhidraBackendError(
+                f'start address ({start_addr}) must be <= end address ({end_addr})'
+            )
         from ghidra.program.model.address import AddressSet
         return (start_addr, end_addr, AddressSet(start_addr, end_addr))
 

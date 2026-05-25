@@ -113,27 +113,48 @@ def test_bug4_resolve_accepts_name_query(server, stub_backend):
 
 
 # ---------------------- Bug 5: inverted range -----------------------------
+# Validation lives in backend._coerce_address_range (start_addr.compareTo).
+# Conftest stubs for xref_to / xref_from now mirror that check.
 
-def test_bug5_xrefs_from_inverted_range_bad_args(server, stub_backend):
+def _stub_xref_with_range_check(stub_backend):
+    """Make the stub's xref_to/xref_from raise like backend._coerce_address_range."""
+    from tinyghidramcp.backend import GhidraBackendError
+    def _check_range(start, end):
+        if start is None or end is None:
+            return
+        # Parse as hex; conftest only sees agent-shaped strings.
+        s_int = int(str(start), 16)
+        e_int = int(str(end), 16)
+        if s_int > e_int:
+            raise GhidraBackendError(
+                f"start address ({start}) must be <= end address ({end})"
+            )
+    def fake(session_id, address=None, start=None, end=None, limit=100):
+        _check_range(start, end)
+        return {"session_id": session_id, "count": 0, "items": []}
+    stub_backend.xref_to = fake
+    stub_backend.xref_from = fake
+
+
+def test_bug5_xrefs_from_inverted_range_rejected(server, stub_backend):
+    _stub_xref_with_range_check(stub_backend)
     r = _call(server, "xrefs.from", {"start": "0x1000", "end": "0x500"})
     sc = r["structuredContent"]
     assert r["isError"] is True
-    assert sc["error_code"] == "bad_args"
-    assert sc["field"] == "end"
+    assert "must be <= end" in sc["error"]
 
 
-def test_bug5_xrefs_to_inverted_range_bad_args(server, stub_backend):
+def test_bug5_xrefs_to_inverted_range_rejected(server, stub_backend):
+    _stub_xref_with_range_check(stub_backend)
     r = _call(server, "xrefs.to", {"start": "0xffff", "end": "0x0"})
     sc = r["structuredContent"]
     assert r["isError"] is True
-    assert sc["error_code"] == "bad_args"
+    assert "must be <= end" in sc["error"]
 
 
 def test_bug5_equal_endpoints_allowed(server, stub_backend):
-    def fake_xref_from(session_id, address=None, start=None, end=None, limit=100):
-        return {"session_id": session_id, "count": 0, "items": []}
-    with patch.object(stub_backend, "xref_from", side_effect=fake_xref_from):
-        r = _call(server, "xrefs.from", {"start": "0x1000", "end": "0x1000"})
+    _stub_xref_with_range_check(stub_backend)
+    r = _call(server, "xrefs.from", {"start": "0x1000", "end": "0x1000"})
     assert r["isError"] is False
 
 

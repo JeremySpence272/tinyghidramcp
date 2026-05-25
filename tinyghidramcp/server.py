@@ -49,26 +49,6 @@ _CODE_REF_TYPES: frozenset[str] = frozenset({
 })
 
 
-def _try_parse_address(value: Any) -> int | None:
-    """Best-effort parse of an address-shaped value to int. Returns None for
-    name-like inputs, malformed numbers, or anything beyond signed-long range."""
-    if isinstance(value, int):
-        return value if 0 <= value <= 0x7fffffffffffffff else None
-    if not isinstance(value, str):
-        return None
-    s = value.strip().lower()
-    try:
-        if s.startswith("0x"):
-            n = int(s, 16)
-        elif any(c in "abcdef" for c in s):
-            n = int(s, 16)
-        else:
-            n = int(s)
-    except ValueError:
-        return None
-    return n if 0 <= n <= 0x7fffffffffffffff else None
-
-
 def _is_data_reference(item: dict[str, Any]) -> bool:
     """True if a reference record represents a data (not code) cross-ref."""
     ref_type = str(item.get("reference_type") or "").upper()
@@ -982,20 +962,6 @@ class SimpleMcpServer:
         def handler(arguments: dict[str, Any]) -> dict[str, Any]:
             include_data = bool(arguments.pop("include_data", False))
             expanded_from = None
-
-            # Inverted-range validation: catch start > end before the call
-            # so we don't propagate Java's IllegalArgumentException as an
-            # "unexpected tool failure" with raw JVM internals leaked.
-            s_int = _try_parse_address(arguments.get("start"))
-            e_int = _try_parse_address(arguments.get("end"))
-            if s_int is not None and e_int is not None and s_int > e_int:
-                raise ToolError(
-                    f"start address (0x{s_int:x}) must be <= end address "
-                    f"(0x{e_int:x})",
-                    error_code="bad_args",
-                    field="end",
-                    expected=f"end >= start (start=0x{s_int:x})",
-                )
 
             if (
                 auto_expand
