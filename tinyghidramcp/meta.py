@@ -1,5 +1,22 @@
 """Hand-written long-form docs for every tool, returned by ``meta.help``.
 
+Address-format note (applies across all tools)
+----------------------------------------------
+Address strings in responses come in two forms depending on the upstream
+producer:
+  - ``"0x..."`` with prefix (used by binary.summary's entry_point and
+    sections[].start/end after our normalization)
+  - ``"NNNNNNNN"`` zero-padded hex without prefix (the default Ghidra
+    ``Address.toString()`` form, used by most other tools)
+
+Both represent the same canonical value. When comparing addresses across
+tool responses, normalize with ``int(addr, 16)`` rather than string
+equality. We don't unify the format at the server because it would require
+walking every response dict with key-name heuristics, which is invasive
+and error-prone.
+
+
+
 Each entry has:
 - ``description``: full prose (longer than the one-line tools/list version)
 - ``parameters``: list of ``{name, type, description, required}``
@@ -50,6 +67,8 @@ DOCS: dict[str, dict[str, Any]] = {
             "Search functions by name. Default is regex (Python `re.search`); set "
             "`exact=true` for literal string match. Regex mode is **case-sensitive**; "
             "the upstream substring fallback (via `exact=true`) is case-INsensitive. "
+            "An empty or missing `name` returns the full function list (paginated "
+            "by `limit`) -- useful for enumeration. "
             "Returns name, entry address, signature, and a `regex: true` flag on the "
             "default path."
         ),

@@ -49,6 +49,26 @@ _CODE_REF_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _try_parse_address(value: Any) -> int | None:
+    """Best-effort parse of an address-shaped value to int. Returns None for
+    name-like inputs, malformed numbers, or anything beyond signed-long range."""
+    if isinstance(value, int):
+        return value if 0 <= value <= 0x7fffffffffffffff else None
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    try:
+        if s.startswith("0x"):
+            n = int(s, 16)
+        elif any(c in "abcdef" for c in s):
+            n = int(s, 16)
+        else:
+            n = int(s)
+    except ValueError:
+        return None
+    return n if 0 <= n <= 0x7fffffffffffffff else None
+
+
 def _is_data_reference(item: dict[str, Any]) -> bool:
     """True if a reference record represents a data (not code) cross-ref."""
     ref_type = str(item.get("reference_type") or "").upper()
@@ -407,6 +427,10 @@ class SimpleMcpServer:
         self._decompile_cache = DecompileCache()
         # Cached binary.summary response for the session; computed once on first call.
         self._binary_summary_cache: dict[str, Any] | None = None
+        # Cached (min_addr, max_addr) for the default address space; used by
+        # tools that need to know whether a query address falls in the image
+        # (e.g. `resolve` for the in_image flag).
+        self._image_bounds_cache: tuple[int, int] | None = None
         # Long-lived single-thread executor for pyghidra.exec. Never shut down
         # explicitly: on timeout we abandon the future and let the worker
         # thread keep running in the JVM until it completes naturally. The
@@ -448,6 +472,15 @@ class SimpleMcpServer:
                 # Same story as search.functions: upstream does substring;
                 # docs (and the example `^GNU`) promise regex.
                 self._tool_handlers[spec["name"]] = self._tool_search_strings
+            elif spec["name"] == "disassemble":
+                # Validate limit > 0 before dispatch (upstream silently
+                # returns []) and validate any explicit address range.
+                self._tool_handlers[spec["name"]] = self._tool_disassemble
+            elif spec["name"] == "resolve":
+                # Tag the response with `in_image: bool` so agents using
+                # resolve as an "is this address real?" check aren't misled
+                # by Ghidra's auto-DAT-label behavior.
+                self._tool_handlers[spec["name"]] = self._tool_resolve
             else:
                 self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
 
@@ -963,6 +996,20 @@ class SimpleMcpServer:
             include_data = bool(arguments.pop("include_data", False))
             expanded_from = None
 
+            # Inverted-range validation: catch start > end before the call
+            # so we don't propagate Java's IllegalArgumentException as an
+            # "unexpected tool failure" with raw JVM internals leaked.
+            s_int = _try_parse_address(arguments.get("start"))
+            e_int = _try_parse_address(arguments.get("end"))
+            if s_int is not None and e_int is not None and s_int > e_int:
+                raise ToolError(
+                    f"start address (0x{s_int:x}) must be <= end address "
+                    f"(0x{e_int:x})",
+                    error_code="bad_args",
+                    field="end",
+                    expected=f"end >= start (start=0x{s_int:x})",
+                )
+
             if (
                 auto_expand
                 and self._auto_session_id is not None
@@ -1222,16 +1269,9 @@ class SimpleMcpServer:
     def _tool_search_functions(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Regex search over function names. Default mode is real Python regex
         (via ``re.search``). ``exact=true`` falls through to the upstream
-        literal-equality path. ``limit`` bounds the *returned* matches; total
-        match count is reported separately."""
+        literal-equality path. Empty / missing ``name`` returns the full
+        function list (paginated by ``limit``) -- useful for enumeration."""
         name = arguments.get("name")
-        if not isinstance(name, str) or not name:
-            raise ToolError(
-                "search.functions requires a non-empty `name` argument",
-                error_code="bad_args",
-                field="name",
-                expected="string (regex pattern, or literal if exact=true)",
-            )
         limit = arguments.get("limit", 50)
         if not isinstance(limit, int) or limit <= 0:
             raise ToolError(
@@ -1241,6 +1281,20 @@ class SimpleMcpServer:
                 expected="positive integer",
             )
         exact = bool(arguments.get("exact", False))
+
+        # Empty / missing pattern -> "list all" via the regex pipeline with
+        # a match-anything pattern. Keeps the response shape consistent with
+        # the regex path (regex: true, total/count/items).
+        if not name:
+            name = ".*"
+
+        if not isinstance(name, str):
+            raise ToolError(
+                "search.functions `name` must be a string when provided",
+                error_code="bad_args",
+                field="name",
+                expected="string (regex pattern, or literal if exact=true)",
+            )
 
         if exact:
             # Upstream's exact path is literal equality on full function name.
@@ -1325,11 +1379,32 @@ class SimpleMcpServer:
             }
     """).strip()
 
+    @staticmethod
+    def _annotate_offset_out_of_range(result: dict[str, Any], offset: int) -> dict[str, Any]:
+        """When offset >= total > 0, attach `offset_out_of_range: true` so the
+        agent can distinguish "no matches" from "you walked off the end of
+        the list"."""
+        if not isinstance(result, dict):
+            return result
+        total = result.get("total")
+        count = result.get("count")
+        if (isinstance(total, int) and total > 0
+                and isinstance(count, int) and count == 0
+                and offset >= total):
+            result = dict(result)
+            result["offset_out_of_range"] = True
+            result["offset_hint"] = (
+                f"offset={offset} is past total={total}; reduce offset or "
+                "refine the query."
+            )
+        return result
+
     def _tool_search_strings(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Regex search over defined strings. Mirrors search.functions: regex
         by default, `exact=true` falls through to the upstream substring path
         (upstream has no equality mode for strings; exact=true behaves the
-        same as the legacy substring search). Invalid regex -> bad_args."""
+        same as the legacy substring search). Invalid regex -> bad_args.
+        Empty / missing query returns the full paginated string list."""
         query = arguments.get("query")
         limit = arguments.get("limit", 100)
         offset = arguments.get("offset", 0)
@@ -1351,16 +1426,18 @@ class SimpleMcpServer:
         # No query at all -> fall through to upstream which returns the full
         # paginated list.
         if not query:
-            return self._backend.binary_strings(
+            r = self._backend.binary_strings(
                 self._auto_session_id, offset=offset, limit=limit, query=None
             )
+            return self._annotate_offset_out_of_range(r, offset)
 
         if bool(arguments.get("exact", False)):
             # Upstream's substring path; agents who set exact=true are opting
             # out of regex and into "literal substring".
-            return self._backend.binary_strings(
+            r = self._backend.binary_strings(
                 self._auto_session_id, offset=offset, limit=limit, query=query
             )
+            return self._annotate_offset_out_of_range(r, offset)
 
         snippet = (
             f"_pattern = {query!r}\n"
@@ -1385,7 +1462,99 @@ class SimpleMcpServer:
                 field="query",
                 expected="valid Python regular expression",
             )
-        return payload
+        return self._annotate_offset_out_of_range(payload, offset)
+
+    # ---------- disassemble (limit validation) ----------------------------
+
+    def _tool_disassemble(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Validate limit > 0 before falling through to the base handler.
+
+        Upstream's `disasm_function` does `if len(items) >= limit: break`,
+        which exits the loop immediately on any negative limit and silently
+        returns an empty list. That looks like 'no instructions found' to the
+        agent instead of 'invalid parameter'. Other tools (xrefs.*, search.*,
+        decompile.*) already validate; this restores parity.
+        """
+        limit = arguments.get("limit")
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ToolError(
+                "limit must be a positive integer",
+                error_code="bad_args",
+                field="limit",
+                expected="positive integer",
+            )
+        # Fall through to the standard handler (with address tolerance).
+        return self._make_backend_handler("disasm_function")(arguments)
+
+    # ---------- resolve (in_image flag) -----------------------------------
+
+    def _tool_resolve(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Wrap upstream's address_resolve to add an `in_image` flag.
+
+        Ghidra auto-creates DAT_* labels for any referenced address,
+        which makes `resolve(query="0x0")` return resolved=true even on a
+        PIE binary with image base 0x100000. The `in_image` flag lets agents
+        using resolve as an "is this address valid?" probe distinguish a
+        real symbol from a Ghidra-synthesized placeholder.
+        """
+        base = self._make_backend_handler("address_resolve")
+        result = base(arguments)
+        if not isinstance(result, dict):
+            return result
+        # Try to determine whether the query is an integer/hex address; if so,
+        # compare against the binary's address range.
+        query = arguments.get("query")
+        addr_int = _try_parse_address(query)
+        if addr_int is None:
+            # Name-based query: in_image isn't meaningful, mark unknown.
+            result = dict(result)
+            result["in_image"] = None
+            return result
+        bounds = self._image_bounds()
+        if bounds is None:
+            result = dict(result)
+            result["in_image"] = None
+            return result
+        lo, hi = bounds
+        in_image = lo <= addr_int <= hi
+        result = dict(result)
+        result["in_image"] = bool(in_image)
+        if not in_image:
+            result["in_image_hint"] = (
+                f"address 0x{addr_int:x} falls outside the loaded range "
+                f"0x{lo:x}..0x{hi:x}; any `symbols` returned are Ghidra "
+                "auto-labels (DAT_*), not real program symbols."
+            )
+        return result
+
+    def _image_bounds(self) -> tuple[int, int] | None:
+        """Return (min, max) address as ints for the loaded program, or None.
+        Cached on the server instance after first lookup."""
+        if getattr(self, "_image_bounds_cache", None) is not None:
+            return self._image_bounds_cache
+        snippet = textwrap.dedent("""
+            mem = program.getMemory()
+            sp = program.getAddressFactory().getDefaultAddressSpace()
+            _lo = None
+            _hi = None
+            for _b in mem.getBlocks():
+                if _b.getStart().getAddressSpace() != sp:
+                    continue
+                _s = _b.getStart().getOffset()
+                _e = _b.getEnd().getOffset()
+                if _lo is None or _s < _lo: _lo = _s
+                if _hi is None or _e > _hi: _hi = _e
+            _ = (_lo, _hi)
+        """).strip()
+        try:
+            raw = self._backend.eval_code(snippet, session_id=self._auto_session_id)
+        except Exception:
+            return None
+        out = raw.get("result") if isinstance(raw, dict) else raw
+        if isinstance(out, (list, tuple)) and len(out) == 2 and out[0] is not None:
+            self._image_bounds_cache = (int(out[0]), int(out[1]))
+            return self._image_bounds_cache
+        return None
 
     # ---------- decompile + decompile.batch -------------------------------
 

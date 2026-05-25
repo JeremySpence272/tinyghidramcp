@@ -70,11 +70,19 @@ def test_invalid_regex_surfaces_bad_args(server, stub_backend):
     assert "unbalanced" in sc["error"]
 
 
-def test_empty_name_rejected(server):
+def test_empty_name_lists_all(server, stub_backend):
+    """Behavior change (Bug 3): empty name no longer rejected; falls through
+    to the regex pipeline with a match-anything pattern, returning the full
+    paginated function list. Aligns with search.strings."""
+    stub_backend.next_eval_response = {
+        "query": ".*", "regex": True, "exact": False,
+        "limit": 5, "total": 2, "count": 2,
+        "items": [{"name": "a"}, {"name": "b"}],
+    }
     r = _call(server, {"name": "", "limit": 5})
     sc = r["structuredContent"]
-    assert r["isError"] is True
-    assert sc["error_code"] == "bad_args"
+    assert r["isError"] is False
+    assert sc["count"] == 2
 
 
 def test_non_positive_limit_rejected(server):
