@@ -51,7 +51,12 @@ def stub_backend():
                          {"timeout_secs": timeout_secs})
             return {"ok": True, "decompile_of": function_start}
 
-        def disasm_function(self, session_id, address, *, limit=None):
+        def disasm_function(self, session_id, address, *, limit=500):
+            # Mirror the real backend's validation so unit tests exercise the
+            # same code path that the live server hits.
+            from tinyghidramcp.backend import GhidraBackendError
+            if limit <= 0:
+                raise GhidraBackendError("limit must be > 0")
             self._record("disasm_function", (session_id, address), {"limit": limit})
             return {"ok": True, "disasm_of": address}
 

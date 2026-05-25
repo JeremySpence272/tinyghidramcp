@@ -427,10 +427,6 @@ class SimpleMcpServer:
         self._decompile_cache = DecompileCache()
         # Cached binary.summary response for the session; computed once on first call.
         self._binary_summary_cache: dict[str, Any] | None = None
-        # Cached (min_addr, max_addr) for the default address space; used by
-        # tools that need to know whether a query address falls in the image
-        # (e.g. `resolve` for the in_image flag).
-        self._image_bounds_cache: tuple[int, int] | None = None
         # Long-lived single-thread executor for pyghidra.exec. Never shut down
         # explicitly: on timeout we abandon the future and let the worker
         # thread keep running in the JVM until it completes naturally. The
@@ -472,15 +468,6 @@ class SimpleMcpServer:
                 # Same story as search.functions: upstream does substring;
                 # docs (and the example `^GNU`) promise regex.
                 self._tool_handlers[spec["name"]] = self._tool_search_strings
-            elif spec["name"] == "disassemble":
-                # Validate limit > 0 before dispatch (upstream silently
-                # returns []) and validate any explicit address range.
-                self._tool_handlers[spec["name"]] = self._tool_disassemble
-            elif spec["name"] == "resolve":
-                # Tag the response with `in_image: bool` so agents using
-                # resolve as an "is this address real?" check aren't misled
-                # by Ghidra's auto-DAT-label behavior.
-                self._tool_handlers[spec["name"]] = self._tool_resolve
             else:
                 self._tool_handlers[spec["name"]] = self._make_backend_handler(spec["backend_method"])
 
@@ -1463,98 +1450,6 @@ class SimpleMcpServer:
                 expected="valid Python regular expression",
             )
         return self._annotate_offset_out_of_range(payload, offset)
-
-    # ---------- disassemble (limit validation) ----------------------------
-
-    def _tool_disassemble(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Validate limit > 0 before falling through to the base handler.
-
-        Upstream's `disasm_function` does `if len(items) >= limit: break`,
-        which exits the loop immediately on any negative limit and silently
-        returns an empty list. That looks like 'no instructions found' to the
-        agent instead of 'invalid parameter'. Other tools (xrefs.*, search.*,
-        decompile.*) already validate; this restores parity.
-        """
-        limit = arguments.get("limit")
-        if limit is not None and (not isinstance(limit, int) or limit <= 0):
-            raise ToolError(
-                "limit must be a positive integer",
-                error_code="bad_args",
-                field="limit",
-                expected="positive integer",
-            )
-        # Fall through to the standard handler (with address tolerance).
-        return self._make_backend_handler("disasm_function")(arguments)
-
-    # ---------- resolve (in_image flag) -----------------------------------
-
-    def _tool_resolve(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Wrap upstream's address_resolve to add an `in_image` flag.
-
-        Ghidra auto-creates DAT_* labels for any referenced address,
-        which makes `resolve(query="0x0")` return resolved=true even on a
-        PIE binary with image base 0x100000. The `in_image` flag lets agents
-        using resolve as an "is this address valid?" probe distinguish a
-        real symbol from a Ghidra-synthesized placeholder.
-        """
-        base = self._make_backend_handler("address_resolve")
-        result = base(arguments)
-        if not isinstance(result, dict):
-            return result
-        # Try to determine whether the query is an integer/hex address; if so,
-        # compare against the binary's address range.
-        query = arguments.get("query")
-        addr_int = _try_parse_address(query)
-        if addr_int is None:
-            # Name-based query: in_image isn't meaningful, mark unknown.
-            result = dict(result)
-            result["in_image"] = None
-            return result
-        bounds = self._image_bounds()
-        if bounds is None:
-            result = dict(result)
-            result["in_image"] = None
-            return result
-        lo, hi = bounds
-        in_image = lo <= addr_int <= hi
-        result = dict(result)
-        result["in_image"] = bool(in_image)
-        if not in_image:
-            result["in_image_hint"] = (
-                f"address 0x{addr_int:x} falls outside the loaded range "
-                f"0x{lo:x}..0x{hi:x}; any `symbols` returned are Ghidra "
-                "auto-labels (DAT_*), not real program symbols."
-            )
-        return result
-
-    def _image_bounds(self) -> tuple[int, int] | None:
-        """Return (min, max) address as ints for the loaded program, or None.
-        Cached on the server instance after first lookup."""
-        if getattr(self, "_image_bounds_cache", None) is not None:
-            return self._image_bounds_cache
-        snippet = textwrap.dedent("""
-            mem = program.getMemory()
-            sp = program.getAddressFactory().getDefaultAddressSpace()
-            _lo = None
-            _hi = None
-            for _b in mem.getBlocks():
-                if _b.getStart().getAddressSpace() != sp:
-                    continue
-                _s = _b.getStart().getOffset()
-                _e = _b.getEnd().getOffset()
-                if _lo is None or _s < _lo: _lo = _s
-                if _hi is None or _e > _hi: _hi = _e
-            _ = (_lo, _hi)
-        """).strip()
-        try:
-            raw = self._backend.eval_code(snippet, session_id=self._auto_session_id)
-        except Exception:
-            return None
-        out = raw.get("result") if isinstance(raw, dict) else raw
-        if isinstance(out, (list, tuple)) and len(out) == 2 and out[0] is not None:
-            self._image_bounds_cache = (int(out[0]), int(out[1]))
-            return self._image_bounds_cache
-        return None
 
     # ---------- decompile + decompile.batch -------------------------------
 

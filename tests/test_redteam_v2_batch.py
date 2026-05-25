@@ -15,29 +15,28 @@ def _call(server, tool, args):
 
 
 # ---------------------- Bug 2: disassemble negative limit ------------------
+# Validation now lives in backend.disasm_function (matching xref_to, etc.).
+# The conftest stub mirrors that. No custom server wrapper.
 
 def test_bug2_disassemble_rejects_negative_limit(server, stub_backend):
+    stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
     r = _call(server, "disassemble", {"address": "0x401234", "limit": -1})
     sc = r["structuredContent"]
     assert r["isError"] is True
-    assert sc["error_code"] == "bad_args"
-    assert sc["field"] == "limit"
+    assert "limit must be > 0" in sc["error"]
 
 
 def test_bug2_disassemble_rejects_zero_limit(server, stub_backend):
+    stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
     r = _call(server, "disassemble", {"address": "0x401234", "limit": 0})
     sc = r["structuredContent"]
     assert r["isError"] is True
-    assert sc["error_code"] == "bad_args"
+    assert "limit must be > 0" in sc["error"]
 
 
 def test_bug2_disassemble_accepts_positive_limit(server, stub_backend):
     stub_backend.next_eval_response = {"kind": "exact", "address": "0x401234", "name": "main"}
-    def fake_disasm(session_id, address, *, limit=None):
-        return {"session_id": session_id, "address": address, "limit": limit,
-                "count": 0, "items": []}
-    with patch.object(stub_backend, "disasm_function", side_effect=fake_disasm):
-        r = _call(server, "disassemble", {"address": "0x401234", "limit": 10})
+    r = _call(server, "disassemble", {"address": "0x401234", "limit": 10})
     assert r["isError"] is False
 
 
@@ -68,38 +67,49 @@ def test_bug3_search_functions_missing_name_lists_all(server, stub_backend):
     assert r["isError"] is False
 
 
-# ---------------------- Bug 4: resolve in_image flag ----------------------
+# ---------------------- Bug 4: resolve rejects out-of-image -----------------
+# Validation now lives in backend.address_resolve. Matches decompile's
+# behavior: any address-shaped query outside the loaded image is rejected
+# instead of returning a synthetic DAT_* label.
 
-def test_bug4_resolve_address_in_image(server, stub_backend):
-    """Address inside the loaded range -> in_image: true."""
-    # Two eval_code calls: image bounds + resolve.
-    # We patch eval_code to return only the bounds; backend's address_resolve
-    # is the stub default.
-    def fake_eval(code, *, session_id=None):
-        return {"result": (0x100000, 0x200000)}
-    with patch.object(stub_backend, "eval_code", side_effect=fake_eval):
-        r = _call(server, "resolve", {"query": "0x150000"})
-    sc = r["structuredContent"]
-    assert r["isError"] is False
-    assert sc["in_image"] is True
-
-
-def test_bug4_resolve_address_out_of_image(server, stub_backend):
-    def fake_eval(code, *, session_id=None):
-        return {"result": (0x100000, 0x200000)}
-    with patch.object(stub_backend, "eval_code", side_effect=fake_eval):
+def test_bug4_resolve_rejects_out_of_image_address(server, stub_backend):
+    def fake_resolve(session_id, query):
+        # Mirror the real backend's check.
+        from tinyghidramcp.backend import GhidraBackendError
+        if isinstance(query, str) and query.startswith("0x"):
+            n = int(query, 16)
+            if n < 0x100000 or n > 0x200000:
+                raise GhidraBackendError(
+                    f"address {query!r} falls outside the loaded image"
+                )
+        return {"session_id": session_id, "query": query, "resolved": True}
+    with patch.object(stub_backend, "address_resolve", side_effect=fake_resolve):
         r = _call(server, "resolve", {"query": "0x0"})
     sc = r["structuredContent"]
+    assert r["isError"] is True
+    assert "outside the loaded image" in sc["error"]
+
+
+def test_bug4_resolve_accepts_in_image_address(server, stub_backend):
+    def fake_resolve(session_id, query):
+        return {"session_id": session_id, "query": query, "resolved": True,
+                "address": query, "symbols": [], "functions": []}
+    with patch.object(stub_backend, "address_resolve", side_effect=fake_resolve):
+        r = _call(server, "resolve", {"query": "0x104860"})
     assert r["isError"] is False
-    assert sc["in_image"] is False
-    assert "auto-labels" in sc["in_image_hint"]
+    assert r["structuredContent"]["resolved"] is True
 
 
-def test_bug4_resolve_name_query_marks_in_image_unknown(server, stub_backend):
-    """Names aren't address-shaped; in_image should be None (unknown)."""
-    r = _call(server, "resolve", {"query": "main"})
-    sc = r["structuredContent"]
-    assert sc["in_image"] is None
+def test_bug4_resolve_accepts_name_query(server, stub_backend):
+    """Names go through the symbol-table path and aren't subject to the
+    in-image check (which only applies to address-shaped queries)."""
+    def fake_resolve(session_id, query):
+        return {"session_id": session_id, "query": query, "resolved": True,
+                "symbols": [{"name": "main", "address": "00104860"}],
+                "functions": []}
+    with patch.object(stub_backend, "address_resolve", side_effect=fake_resolve):
+        r = _call(server, "resolve", {"query": "main"})
+    assert r["isError"] is False
 
 
 # ---------------------- Bug 5: inverted range -----------------------------

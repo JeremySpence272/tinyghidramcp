@@ -182,6 +182,8 @@ class GhidraBackend:
         return {'session_id': session_id, 'offset': offset, 'limit': limit, 'total': len(strings), 'count': len(items), 'items': items}
 
     def disasm_function(self, session_id: str, address: int | str, *, limit: int=500) -> dict[str, Any]:
+        if limit <= 0:
+            raise GhidraBackendError('limit must be > 0')
         function = self._resolve_function(session_id, address)
         items = self._disassemble_instructions(self._get_program(session_id).getListing().getInstructions(function.getBody(), True), limit)
         return {'session_id': session_id, 'function': self._function_record(function), 'count': len(items), 'items': items}
@@ -275,8 +277,22 @@ class GhidraBackend:
         if query is None or (isinstance(query, str) and (not query.strip())):
             raise GhidraBackendError('query is required')
         payload: dict[str, Any] = {'session_id': session_id, 'query': query, 'resolved': False}
-        with suppress(GhidraBackendError):
+        # Try to parse as an address. We do this OUTSIDE a `with suppress`
+        # block (unlike the rest of the address-path logic) so the
+        # out-of-image rejection below can propagate to the caller instead of
+        # being swallowed and falling through to the name-based path.
+        try:
             addr = self._coerce_address(session_id, query, 'query')
+        except GhidraBackendError:
+            addr = None
+        if addr is not None:
+            # Reject out-of-image addresses so resolve matches decompile's
+            # contract: any address-shaped query that isn't inside a loaded
+            # memory block is bad_args, not a synthetic DAT_* hit.
+            if not self._get_program(session_id).getMemory().contains(addr):
+                raise GhidraBackendError(
+                    f"address {query!r} falls outside the loaded image"
+                )
             payload['resolved'] = True
             payload['address'] = self._addr_str(addr)
             with suppress(GhidraBackendError):
